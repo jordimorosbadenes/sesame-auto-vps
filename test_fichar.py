@@ -96,7 +96,11 @@ SESSION_FILE   = _resolve_path("SESAME_SESSION", "browser_session.json").parent 
 CHECKS_URL = "https://panel.sesametime.com/admin/users/checks"
 LOGIN_URL  = "https://panel.sesametime.com"
 
-HEADLESS = "--headless" in sys.argv  # por defecto muestra el navegador
+# Headless si:
+#  - se pasa --headless explícitamente, O
+#  - no hay DISPLAY ni WAYLAND_DISPLAY (VPS sin pantalla)
+_has_display = bool(os.environ.get("DISPLAY") or os.environ.get("WAYLAND_DISPLAY"))
+HEADLESS = "--headless" in sys.argv or not _has_display
 
 # ── Selectores (mismos que sesame_auto.py) ────────────────────────────────────
 LOGIN_EMAIL_SEL    = ["#UserEmail", 'input[name="email"]', 'input[type="email"]']
@@ -197,7 +201,10 @@ def run_test():
 
     info(f"Usuario:   {EMAIL}")
     info(f"URL:       {CHECKS_URL}")
-    info(f"Navegador: {'headless' if HEADLESS else 'visible (puedes verlo)'}")
+    if HEADLESS and not _has_display and "--headless" not in sys.argv:
+        info("Navegador: headless (sin pantalla detectada en el servidor)")
+    else:
+        info(f"Navegador: {'headless' if HEADLESS else 'visible (puedes verlo)'}")
     sep()
 
     final_screenshot = None
