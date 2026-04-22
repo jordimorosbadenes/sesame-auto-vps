@@ -44,14 +44,6 @@ echo ""
 echo "[ 1/6 ] Instalando dependencias del sistema…"
 apt-get update -q
 apt-get install -y -q python3 python3-pip python3-venv
-
-# Dependencias de sistema que Chromium headless necesita en Debian/Ubuntu
-apt-get install -y -q \
-  libglib2.0-0 libnss3 libnspr4 libdbus-1-3 libatk1.0-0 \
-  libatk-bridge2.0-0 libcups2 libdrm2 libxkbcommon0 libxcomposite1 \
-  libxdamage1 libxfixes3 libxrandr2 libgbm1 libasound2 \
-  libpangocairo-1.0-0 libpango-1.0-0 libcairo2 libatspi2.0-0 \
-  libgtk-3-0 2>/dev/null || true
 echo "   ✔ Dependencias del sistema listas."
 
 # ── 3. Crear directorio de instalación ────────────────────────────────────────
@@ -75,19 +67,17 @@ for username in "${FOUND_USERS[@]}"; do
     dst="$INSTALL_DIR/users/$username"
     mkdir -p "$dst"
 
-    # .env: NO sobreescribir si ya existe (gitignored, se crea una sola vez en el VPS)
-    if [ ! -f "$dst/.env" ]; then
-        cp "$src/.env" "$dst/.env"
-        chmod 600 "$dst/.env"
-        echo "   ✔ Usuario '$username': .env creado → $dst/.env"
-    else
-        echo "   ℹ  Usuario '$username': .env ya existe, no sobreescrito (edita manualmente si es necesario)."
-    fi
+    # Copiar solo el .env (no sobreescribir state.json, sesiones, etc. si ya existen)
+    cp "$src/.env" "$dst/.env"
+    chmod 600 "$dst/.env"
+    echo "   ✔ Usuario '$username': .env copiado → $dst/.env"
 
-    # vacaciones.txt: SIEMPRE sobreescribir (está en git, es la fuente autoritativa)
-    if [ -f "$src/vacaciones.txt" ]; then
+    # Copiar vacaciones.txt si existe (no sobreescribir si ya hay uno en destino)
+    if [ -f "$src/vacaciones.txt" ] && [ ! -f "$dst/vacaciones.txt" ]; then
         cp "$src/vacaciones.txt" "$dst/vacaciones.txt"
-        echo "   ✔ Usuario '$username': vacaciones.txt actualizado."
+        echo "   ✔ Usuario '$username': vacaciones.txt copiado → $dst/vacaciones.txt"
+    elif [ -f "$src/vacaciones.txt" ]; then
+        echo "   ℹ  Usuario '$username': vacaciones.txt ya existe en destino, no sobreescrito."
     else
         echo "   ⚠  Usuario '$username': no tiene vacaciones.txt (crea uno si es necesario)."
     fi
@@ -99,6 +89,8 @@ python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
 "$VENV_DIR/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
 "$VENV_DIR/bin/python" -m playwright install chromium
+# Instala las dependencias de sistema que Chromium necesita (detecta la distro automáticamente)
+"$VENV_DIR/bin/python" -m playwright install-deps chromium
 echo "   ✔ Python y Chromium listos."
 
 # ── 7. Cron jobs (uno por usuario, L-V a las 07:00) ──────────────────────────
