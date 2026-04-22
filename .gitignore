@@ -1,0 +1,12 @@
+.env
+users/**/.env
+__pycache__/
+*.pyc
+*.pyo
+venv/
+state.json
+*.log
+users/**/state.json
+users/**/browser_session*.json
+users/**/screenshots*/
+users/**/screenshots_test/
