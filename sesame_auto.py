@@ -219,6 +219,26 @@ def _click_check_button(page: Page, action_label: str) -> bool:
     log.info(f"  Buscando botón de fichaje ({action_label})…")
 
     btn = _first_visible(page, CHECK_BUTTON_SELECTORS, timeout=10000)
+
+    # Fallback: el botón puede estar dentro del dropdown "Acciones"
+    if not btn:
+        log.info("  Botón directo no encontrado. Probando dropdown 'Acciones'…")
+        acciones_btn = _first_visible(page, [
+            "button.dropdown-toggle.btn-settings",
+            "button:has-text('Acciones')",
+            ".btn-settings.dropdown-toggle",
+        ], timeout=5000)
+        if acciones_btn:
+            acciones_btn.click()
+            time.sleep(0.8)
+            btn = _first_visible(page, [
+                ".dropdown-menu a:has-text('Fichar')",
+                ".dropdown-menu li:has-text('Fichar')",
+                "a:has-text('Fichar')",
+                "li:has-text('Fichar') a",
+                "[class*='dropdown'] a:has-text('Fichar')",
+            ], timeout=5000)
+
     if not btn:
         log.error("  ✗ No se encontró el botón de fichaje.")
         _take_screenshot(page, f"no_button_{action_label}")
