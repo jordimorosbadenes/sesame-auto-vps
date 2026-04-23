@@ -98,14 +98,17 @@ echo "[ 6/6 ] Configurando cron jobs…"
 
 # Elimina TODAS las entradas anteriores de sesame_auto para reconstruirlas limpias
 # Esto garantiza que si se añade/elimina un usuario, el cron queda siempre correcto
-CLEAN_CRONTAB=$(crontab -l 2>/dev/null | grep -v "sesame_auto" || true)
+CLEAN_CRONTAB=$(crontab -l 2>/dev/null | grep -v "sesame_auto" | grep -v "^TZ=Europe/Madrid" || true)
 
 NEW_CRON_LINES=""
+# La línea TZ= en crontab fija la zona horaria para todos los jobs siguientes.
+# Sin esto, cron usa UTC del servidor y el script ficharía 2h tarde en verano.
+NEW_CRON_LINES=$'\nTZ=Europe/Madrid'
 for username in "${FOUND_USERS[@]}"; do
     ENV_PATH="$INSTALL_DIR/users/$username/.env"
     CRON_LINE="0 7 * * 1-5 $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $ENV_PATH"
     NEW_CRON_LINES="$NEW_CRON_LINES"$'\n'"$CRON_LINE"
-    echo "   ✔ Cron '$username': L-V 07:00 → sesame_auto.py --env $ENV_PATH"
+    echo "   ✔ Cron '$username': L-V 07:00 Madrid → sesame_auto.py --env $ENV_PATH"
 done
 
 # Instalar crontab limpio + nuevos jobs
