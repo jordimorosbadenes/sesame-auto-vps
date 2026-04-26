@@ -106,9 +106,9 @@ NEW_CRON_LINES=""
 NEW_CRON_LINES=$'\nTZ=Europe/Madrid'
 for username in "${FOUND_USERS[@]}"; do
     ENV_PATH="$INSTALL_DIR/users/$username/.env"
-    CRON_LINE="0 7 * * 1-5 $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $ENV_PATH"
+    CRON_LINE="30 5 * * 1-5 $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $ENV_PATH"
     NEW_CRON_LINES="$NEW_CRON_LINES"$'\n'"$CRON_LINE"
-    echo "   ✔ Cron '$username': L-V 07:00 Madrid → sesame_auto.py --env $ENV_PATH"
+    echo "   ✔ Cron '$username': L-V 05:30 Madrid → sesame_auto.py --env $ENV_PATH"
 done
 
 # Instalar crontab limpio + nuevos jobs
@@ -133,7 +133,7 @@ for username in "${FOUND_USERS[@]}"; do
     echo "  · $username → $INSTALL_DIR/users/$username/.env"
 done
 echo ""
-echo "Cron activo (L-V 07:00):"
+echo "Cron activo (L-V 05:30):"
 crontab -l | grep "sesame_auto" || true
 echo ""
 echo "Prueba en seco (sin fichar):"
