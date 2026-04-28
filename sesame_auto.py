@@ -26,6 +26,7 @@ import os
 import random
 import sys
 import time
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FuturesTimeout
 from datetime import date, datetime, timedelta
 from pathlib import Path
 from zoneinfo import ZoneInfo
@@ -66,6 +67,11 @@ VACACIONES_FILE  = _resolve_path("SESAME_VACACIONES",  "vacaciones.txt")
 DRY_RUN          = os.environ.get("SESAME_DRY_RUN", "false").lower() == "true"
 TARGET_H         = float(os.environ.get("SESAME_TARGET_HOURS", "40.0"))
 HEADLESS         = os.environ.get("SESAME_HEADLESS", "true").lower() == "true"
+
+# Robustez: timeout y reintentos por fichaje
+MAX_CHECK_TIMEOUT_S = 8 * 60   # límite total por intento (8 min)
+MAX_RETRIES         = 2         # reintentos adicionales si falla
+RETRY_DELAY_S       = 3 * 60   # segundos entre reintentos
 
 CHECKS_URL  = "https://panel.sesametime.com/admin/users/checks"
 LOGIN_URL   = "https://panel.sesametime.com"
@@ -250,7 +256,12 @@ def _click_check_button(page: Page, action_label: str) -> bool:
 
     # Interceptar alert nativo antes del click
     page.once("dialog", lambda d: d.accept())
-    btn.click()
+    try:
+        btn.click(timeout=15_000)
+    except PlaywrightTimeout:
+        # El click se realizó; el timeout fue en la espera de navegación post-click.
+        log.warning("  ⚠ Timeout post-click — el fichaje probablemente se completó igualmente.")
+        _take_screenshot(page, f"click_timeout_{action_label}")
     time.sleep(1.5)
 
     # Confirmar modal si aparece (ej. SweetAlert2)
@@ -304,10 +315,12 @@ def do_check(action_label: str) -> bool:
 
         context: BrowserContext = browser.new_context(**ctx_kwargs)
         page: Page = context.new_page()
+        page.set_default_navigation_timeout(90_000)  # 90 s máx para cualquier goto
+        page.set_default_timeout(30_000)             # 30 s máx para selectores
 
         try:
             log.info(f"  Navegando a {CHECKS_URL} …")
-            page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=30000)
+            page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=90_000)
             time.sleep(2)
 
             if _needs_login(page):
@@ -333,6 +346,27 @@ def do_check(action_label: str) -> bool:
         finally:
             context.close()
             browser.close()
+
+
+def do_check_with_timeout(action_label: str) -> bool:
+    """
+    Ejecuta do_check con un límite de MAX_CHECK_TIMEOUT_S segundos.
+    Si Playwright se queda colgado (por ejemplo, página muy lenta),
+    el futuro expira y se devuelve False para que el llamador pueda reintentar.
+    """
+    with ThreadPoolExecutor(max_workers=1) as executor:
+        future = executor.submit(do_check, action_label)
+        try:
+            return future.result(timeout=MAX_CHECK_TIMEOUT_S)
+        except FuturesTimeout:
+            log.error(
+                f"  ✗ do_check({action_label}) superó el límite de "
+                f"{MAX_CHECK_TIMEOUT_S // 60} min. Abortando intento."
+            )
+            return False
+        except Exception as e:
+            log.error(f"  ✗ Excepción en do_check({action_label}): {e}")
+            return False
 
 
 # ── Estado persistente ────────────────────────────────────────────────────────
@@ -581,7 +615,17 @@ def main():
 
         _sleep_until(target_dt)
 
-        success = do_check(action_label)
+        success = False
+        for attempt in range(MAX_RETRIES + 1):
+            if attempt > 0:
+                log.warning(
+                    f"  🔄 Reintentando {step_name} en {RETRY_DELAY_S // 60} min "
+                    f"(intento {attempt + 1}/{MAX_RETRIES + 1})…"
+                )
+                time.sleep(RETRY_DELAY_S)
+            success = do_check_with_timeout(action_label)
+            if success:
+                break
         actual_now = datetime.now(tz)
 
         if success:
