@@ -171,31 +171,51 @@ def _needs_login(page: Page) -> bool:
 
 def _do_login(page: Page) -> bool:
     log.info("  Sesión no activa, haciendo login…")
-    for sel in ["#UserEmail", 'input[name="email"]', 'input[type="email"]']:
+    log.info(f"  URL en login: {page.url}")
+    email_filled = False
+    for sel in ["#UserEmail", 'input[name="email"]', 'input[type="email"]',
+                'input[name="data[User][email]"]']:
         try:
-            el = page.wait_for_selector(sel, timeout=8000, state="visible")
+            el = page.wait_for_selector(sel, timeout=5000, state="visible")
             if el:
                 el.fill(SESAME_EMAIL)
+                log.info(f"  Email rellenado con selector: {sel}")
+                email_filled = True
                 break
         except PlaywrightTimeout:
+            log.debug(f"  Email selector no encontrado: {sel}")
             continue
+    if not email_filled:
+        log.error("  No se encontró el campo de email. Email vacío.")
+        _screenshot(page, "login_no_email")
+        return False
     time.sleep(0.3)
-    for sel in ["#UserPassword", 'input[name="password"]', 'input[type="password"]']:
+    pwd_filled = False
+    for sel in ["#UserPassword", 'input[name="password"]', 'input[type="password"]',
+                'input[name="data[User][password]"]']:
         try:
             el = page.wait_for_selector(sel, timeout=5000, state="visible")
             if el:
                 el.fill(SESAME_PASSWORD)
+                log.info(f"  Password rellenado con selector: {sel}")
+                pwd_filled = True
                 break
         except PlaywrightTimeout:
+            log.debug(f"  Password selector no encontrado: {sel}")
             continue
+    if not pwd_filled:
+        log.error("  No se encontró el campo de contraseña.")
+        _screenshot(page, "login_no_pwd")
+        return False
     time.sleep(0.3)
-    for sel in ['button[type="submit"]', 'input[type="submit"]',
+    for sel in ['input[type="submit"]', 'button[type="submit"]',
                 "button:has-text('Entrar')", "button:has-text('Iniciar sesión')",
                 "button:has-text('Login')"]:
         try:
             el = page.wait_for_selector(sel, timeout=5000, state="visible")
             if el:
                 el.click()
+                log.info(f"  Submit clickado: {sel}")
                 break
         except PlaywrightTimeout:
             continue
@@ -212,6 +232,7 @@ def _do_login(page: Page) -> bool:
             log.info(f"  Login completado (sin cambio URL). URL: {page.url}")
             return True
         log.error(f"  Login fallido. URL: {page.url}")
+        _screenshot(page, "login_failed")
         return False
 
 
@@ -239,6 +260,14 @@ VACATIONS_NAV_SELECTORS = [
     "[href*='vacation']",
     "[href*='vacacion']",
 ]
+
+
+def _screenshot(page: Page, path):
+    """Toma un screenshot ignorando errores (no debe bloquear el flujo)."""
+    try:
+        page.screenshot(path=str(path), timeout=5000)
+    except Exception as e:
+        log.debug(f"  Screenshot omitido: {e}")
 
 
 def _find_ical_button(page: Page):
@@ -274,8 +303,9 @@ def download_ical_playwright() -> str | None:
             "locale": "es-ES",
             "accept_downloads": True,
         }
-        if SESSION_FILE.exists():
-            ctx_kwargs["storage_state"] = str(SESSION_FILE)
+        # No cargamos session guardada aquí: una sesión parcial/expirada
+        # hace que el login aterrice en el home sin sidebar en vez del dashboard.
+        # Siempre login fresco para garantizar redirect al dashboard completo.
 
         context: BrowserContext = browser.new_context(**ctx_kwargs)
         page: Page = context.new_page()
@@ -286,21 +316,24 @@ def download_ical_playwright() -> str | None:
         _sc_dir.mkdir(parents=True, exist_ok=True)
 
         try:
-            # ── Login: ir al home y autenticar ────────────────────────────────
-            log.info(f"  Navegando a {LOGIN_URL} …")
-            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=90_000)
+            # ── Login: igual que sesame_auto.py, ir a CHECKS_URL primero.     ──
+            # CHECKS_URL redirige a /users/login?redirect=... si no hay sesión,
+            # lo que permite detectar el cambio de URL tras el submit del login.
+            # (Ir directamente a LOGIN_URL no funciona: la SPA renderiza el form
+            # en panel.sesametime.com/ sin "login" en la URL, y wait_for_url
+            # resuelve inmediatamente antes de que el form se envíe.)
+            log.info(f"  Navegando a {CHECKS_URL} …")
+            page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=90_000)
             time.sleep(2)
 
             if _needs_login(page):
                 if not _do_login(page):
                     log.error("  Login fallido.")
                     return None
-                SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-                context.storage_state(path=str(SESSION_FILE))
 
             log.info(f"  Sesión activa. URL: {page.url}")
 
-            # ── Navegar a "Mis vacaciones" via click (no goto, para no perder sesión SPA) ──
+            # ── Navegar a "Mis vacaciones" via click ──────────────────────────
             log.info("  Buscando botón 'Mis vacaciones' en el menú…")
             vacaciones_btn = None
             for sel in VACATIONS_NAV_SELECTORS:
@@ -315,7 +348,7 @@ def download_ical_playwright() -> str | None:
 
             if not vacaciones_btn:
                 log.error("  No se encontró el botón 'Mis vacaciones'.")
-                page.screenshot(path=str(_sc_dir / "no_vacaciones_btn.png"))
+                _screenshot(page, _sc_dir / "no_vacaciones_btn.png")
                 log.error(f"  Screenshot: {_sc_dir / 'no_vacaciones_btn.png'}")
                 return None
 
@@ -326,7 +359,7 @@ def download_ical_playwright() -> str | None:
                 pass
             time.sleep(2)
             log.info(f"  URL vacaciones: {page.url}")
-            page.screenshot(path=str(_sc_dir / "vacations_page.png"))
+            _screenshot(page, _sc_dir / "vacations_page.png")
 
             # ── Buscar el botón de exportar iCal ──────────────────────────────
             ical_el = _find_ical_button(page)
@@ -334,7 +367,7 @@ def download_ical_playwright() -> str | None:
             if not ical_el:
                 log.error("  ✗ No se encontró el botón 'Exportar iCal'.")
                 log.error("  → Usa --ical /ruta/Sesame-Calendar.ics para modo manual.")
-                page.screenshot(path=str(_sc_dir / "update_vacaciones_no_button.png"))
+                _screenshot(page, _sc_dir / "update_vacaciones_no_button.png")
                 log.error(f"  Screenshots en: {_sc_dir}")
                 return None
 
