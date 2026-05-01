@@ -319,7 +319,7 @@ def download_ical_playwright() -> str | None:
             # ── Descarga ──────────────────────────────────────────────────────
             log.info("  Iniciando descarga del iCal…")
             with page.expect_download(timeout=30_000) as dl_info:
-                ical_el.click()
+                ical_el.click(no_wait_after=True)
             download = dl_info.value
             ical_path = Path(download.path())
             content = ical_path.read_text(encoding="utf-8")
