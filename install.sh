@@ -52,11 +52,12 @@ mkdir -p "$INSTALL_DIR"
 
 # ── 4. Copiar scripts ─────────────────────────────────────────────────────────
 echo "[ 3/6 ] Copiando scripts…"
-cp "$SCRIPT_DIR/sesame_auto.py"  "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/test_fichar.py"  "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/requirements.txt" "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/.env.example"    "$INSTALL_DIR/"
-chmod 755 "$INSTALL_DIR/sesame_auto.py" "$INSTALL_DIR/test_fichar.py"
+cp "$SCRIPT_DIR/sesame_auto.py"        "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/update_vacaciones.py"  "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/test_fichar.py"        "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/requirements.txt"      "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/.env.example"          "$INSTALL_DIR/"
+chmod 755 "$INSTALL_DIR/sesame_auto.py" "$INSTALL_DIR/update_vacaciones.py" "$INSTALL_DIR/test_fichar.py"
 echo "   ✔ Scripts copiados."
 
 # ── 5. Copiar carpetas de usuarios ────────────────────────────────────────────
@@ -96,9 +97,9 @@ echo "   ✔ Python y Chromium listos."
 # ── 7. Cron jobs (uno por usuario, L-V a las 07:00) ──────────────────────────
 echo "[ 6/6 ] Configurando cron jobs…"
 
-# Elimina TODAS las entradas anteriores de sesame_auto para reconstruirlas limpias
+# Elimina TODAS las entradas anteriores para reconstruirlas limpias
 # Esto garantiza que si se añade/elimina un usuario, el cron queda siempre correcto
-CLEAN_CRONTAB=$(crontab -l 2>/dev/null | grep -v "sesame_auto" | grep -v "^TZ=Europe/Madrid" || true)
+CLEAN_CRONTAB=$(crontab -l 2>/dev/null | grep -v "sesame_auto" | grep -v "update_vacaciones" | grep -v "^TZ=Europe/Madrid" || true)
 
 NEW_CRON_LINES=""
 # La línea TZ= en crontab fija la zona horaria para todos los jobs siguientes.
@@ -106,9 +107,14 @@ NEW_CRON_LINES=""
 NEW_CRON_LINES=$'\nTZ=Europe/Madrid'
 for username in "${FOUND_USERS[@]}"; do
     ENV_PATH="$INSTALL_DIR/users/$username/.env"
+    # Fichaje diario: lunes a viernes a las 05:30
     CRON_LINE="30 5 * * 1-5 $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $ENV_PATH"
     NEW_CRON_LINES="$NEW_CRON_LINES"$'\n'"$CRON_LINE"
     echo "   ✔ Cron '$username': L-V 05:30 Madrid → sesame_auto.py --env $ENV_PATH"
+    # Actualización mensual de vacaciones: día 1 de cada mes a las 05:00 (antes del fichaje)
+    CRON_VAC="0 5 1 * * $VENV_DIR/bin/python $INSTALL_DIR/update_vacaciones.py --env $ENV_PATH"
+    NEW_CRON_LINES="$NEW_CRON_LINES"$'\n'"$CRON_VAC"
+    echo "   ✔ Cron '$username': día 1 de cada mes 05:00 → update_vacaciones.py"
 done
 
 # Instalar crontab limpio + nuevos jobs
@@ -135,6 +141,16 @@ done
 echo ""
 echo "Cron activo (L-V 05:30):"
 crontab -l | grep "sesame_auto" || true
+echo ""
+echo "Actualizar vacaciones.txt desde Sesame (ejecutar tras instalar):"
+for username in "${FOUND_USERS[@]}"; do
+    echo "  $VENV_DIR/bin/python $INSTALL_DIR/update_vacaciones.py --env $INSTALL_DIR/users/$username/.env"
+done
+echo ""
+echo "  O bien con un iCal ya descargado de Sesame → Mis vacaciones → Exportar iCal:"
+for username in "${FOUND_USERS[@]}"; do
+    echo "  $VENV_DIR/bin/python $INSTALL_DIR/update_vacaciones.py --env $INSTALL_DIR/users/$username/.env --ical /ruta/Sesame-Calendar.ics"
+done
 echo ""
 echo "Prueba en seco (sin fichar):"
 for username in "${FOUND_USERS[@]}"; do
