@@ -1,0 +1,5 @@
+# Este fichero se genera automáticamente cada día a las 05:00 por update_vacaciones.py
+# No editar manualmente — los cambios se sobreescribirán.
+#
+# Para regenerarlo ahora:
+#   /opt/sesame/venv/bin/python /opt/sesame/update_vacaciones.py --env /opt/sesame/users/jordi/.env
