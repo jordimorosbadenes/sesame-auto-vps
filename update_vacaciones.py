@@ -352,10 +352,20 @@ def download_ical_playwright() -> str | None:
                 log.error(f"  Screenshot: {_sc_dir / 'no_vacaciones_btn.png'}")
                 return None
 
-            vacaciones_btn.click()
-            # Esperar cambio de URL — NO usar networkidle (cuelga en VPS headless)
+            # Click "Mis vacaciones" — el click dispara navegación que puede
+            # tardar y agotar el timeout; si la URL cambia, fue exitoso.
             try:
-                page.wait_for_url(lambda url: "vacation" in url.lower(), timeout=15_000)
+                vacaciones_btn.click(timeout=15_000)
+            except PlaywrightTimeout:
+                # La navegación ocurrió (ver call log) pero la carga tardó más
+                # del timeout. Si ya estamos en la URL correcta, continuamos.
+                if "vacation" not in page.url.lower():
+                    log.error("  Click 'Mis vacaciones' falló sin navegar.")
+                    return None
+                log.warning("  Click timeout pero URL cambió — continuando.")
+            # Esperar cambio de URL confirmado
+            try:
+                page.wait_for_url(lambda url: "vacation" in url.lower(), timeout=10_000)
             except PlaywrightTimeout:
                 pass
             time.sleep(3)
