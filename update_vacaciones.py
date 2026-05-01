@@ -354,21 +354,13 @@ def download_ical_playwright() -> str | None:
 
             vacaciones_btn.click()
             try:
-                page.wait_for_load_state("networkidle", timeout=15_000)
+                page.wait_for_load_state("domcontentloaded", timeout=15_000)
             except PlaywrightTimeout:
                 pass
-            time.sleep(2)
+            time.sleep(3)
             log.info(f"  URL vacaciones: {page.url}")
-            _screenshot(page, _sc_dir / "vacations_page.png")
 
             # ── Buscar el botón de exportar iCal ──────────────────────────────
-            # Espera adicional antes de buscar el botón (la SPA puede tardar más en VPS)
-            try:
-                page.wait_for_load_state("networkidle", timeout=10_000)
-            except PlaywrightTimeout:
-                pass
-
-            ical_el = _find_ical_button(page)
 
             if not ical_el:
                 # Diagnóstico: listar todos los enlaces y botones visibles
@@ -389,8 +381,6 @@ def download_ical_playwright() -> str | None:
                 for item in visible_links[:40]:
                     log.error(item)
                 log.error("  → Usa --ical /ruta/Sesame-Calendar.ics para modo manual.")
-                _screenshot(page, _sc_dir / "update_vacaciones_no_button.png")
-                log.error(f"  Screenshots en: {_sc_dir}")
                 return None
 
             # ── Descarga ──────────────────────────────────────────────────────
