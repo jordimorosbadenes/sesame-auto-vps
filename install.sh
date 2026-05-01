@@ -111,10 +111,10 @@ for username in "${FOUND_USERS[@]}"; do
     CRON_LINE="30 5 * * 1-5 $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $ENV_PATH"
     NEW_CRON_LINES="$NEW_CRON_LINES"$'\n'"$CRON_LINE"
     echo "   ✔ Cron '$username': L-V 05:30 Madrid → sesame_auto.py --env $ENV_PATH"
-    # Actualización mensual de vacaciones: día 1 de cada mes a las 05:00 (antes del fichaje)
-    CRON_VAC="0 5 1 * * $VENV_DIR/bin/python $INSTALL_DIR/update_vacaciones.py --env $ENV_PATH"
+    # Actualización diaria de vacaciones: cada día a las 05:00, antes del fichaje de las 05:30
+    CRON_VAC="0 5 * * * $VENV_DIR/bin/python $INSTALL_DIR/update_vacaciones.py --env $ENV_PATH"
     NEW_CRON_LINES="$NEW_CRON_LINES"$'\n'"$CRON_VAC"
-    echo "   ✔ Cron '$username': día 1 de cada mes 05:00 → update_vacaciones.py"
+    echo "   ✔ Cron '$username': diario 05:00 → update_vacaciones.py"
 done
 
 # Instalar crontab limpio + nuevos jobs
@@ -142,7 +142,7 @@ echo ""
 echo "Cron activo (L-V 05:30):"
 crontab -l | grep "sesame_auto" || true
 echo ""
-echo "Actualizar vacaciones.txt desde Sesame (ejecutar tras instalar):"
+echo "Actualizar vacaciones.txt desde Sesame iCal (ejecutar tras instalar, luego automático cada día a las 05:00):"
 for username in "${FOUND_USERS[@]}"; do
     echo "  $VENV_DIR/bin/python $INSTALL_DIR/update_vacaciones.py --env $INSTALL_DIR/users/$username/.env"
 done
