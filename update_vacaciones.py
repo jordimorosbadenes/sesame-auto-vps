@@ -61,8 +61,15 @@ VACACIONES_FILE = _resolve_path("SESAME_VACACIONES", "vacaciones.txt")
 HEADLESS        = os.environ.get("SESAME_HEADLESS",  "true").lower() == "true"
 
 LOGIN_URL     = "https://panel.sesametime.com"
-VACATIONS_URL = "https://panel.sesametime.com/admin/users/vacations"
-CHECKS_URL    = "https://panel.sesametime.com/admin/users/checks"
+VACATIONS_URL   = "https://panel.sesametime.com/admin/users/vacations"
+CHECKS_URL      = "https://panel.sesametime.com/admin/users/checks"
+# URLs alternativas por si la principal requiere permisos de admin
+VACATIONS_PATHS = [
+    "https://panel.sesametime.com/admin/users/vacations",
+    "https://panel.sesametime.com/users/vacations",
+    "https://panel.sesametime.com/vacations",
+    "https://panel.sesametime.com",   # home: buscar via menú
+]
 
 # ── Logging ───────────────────────────────────────────────────────────────────
 logging.basicConfig(
@@ -194,10 +201,18 @@ def _do_login(page: Page) -> bool:
             continue
     try:
         page.wait_for_url(lambda url: "login" not in url.lower(), timeout=15000)
-        log.info("  Login completado.")
+        log.info(f"  Login completado. URL: {page.url}")
+        try:
+            page.wait_for_load_state("networkidle", timeout=10_000)
+        except PlaywrightTimeout:
+            pass
         return True
     except PlaywrightTimeout:
-        return not _needs_login(page)
+        if not _needs_login(page):
+            log.info(f"  Login completado (sin cambio URL). URL: {page.url}")
+            return True
+        log.error(f"  Login fallido. URL: {page.url}")
+        return False
 
 
 # ── Playwright: descarga del iCal ─────────────────────────────────────────────
@@ -267,59 +282,76 @@ def download_ical_playwright() -> str | None:
         page.set_default_navigation_timeout(90_000)
         page.set_default_timeout(15_000)
 
+        _sc_dir = _user_dir / "screenshots"
+        _sc_dir.mkdir(parents=True, exist_ok=True)
+
         try:
-            # ── Intento 1: ir directamente a la URL de vacaciones ─────────────
-            log.info(f"  Navegando a {VACATIONS_URL} …")
-            page.goto(VACATIONS_URL, wait_until="domcontentloaded", timeout=90_000)
+            # ── Login: ir al home y autenticar ────────────────────────────────
+            log.info(f"  Navegando a {LOGIN_URL} …")
+            page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=90_000)
             time.sleep(2)
 
             if _needs_login(page):
-                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=30_000)
-                time.sleep(1)
                 if not _do_login(page):
                     log.error("  Login fallido.")
                     return None
-                # Guardar sesión
                 SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
                 context.storage_state(path=str(SESSION_FILE))
-                page.goto(VACATIONS_URL, wait_until="domcontentloaded", timeout=90_000)
-                time.sleep(2)
 
+            log.info(f"  Sesión activa. URL: {page.url}")
+
+            # ── Navegar a "Mis vacaciones" via click (no goto, para no perder sesión SPA) ──
+            log.info("  Buscando botón 'Mis vacaciones' en el menú…")
+            vacaciones_btn = None
+            for sel in VACATIONS_NAV_SELECTORS:
+                try:
+                    el = page.wait_for_selector(sel, timeout=5000, state="visible")
+                    if el:
+                        log.info(f"  Encontrado: {sel!r} → '{el.inner_text().strip()}'")
+                        vacaciones_btn = el
+                        break
+                except PlaywrightTimeout:
+                    continue
+
+            if not vacaciones_btn:
+                log.error("  No se encontró el botón 'Mis vacaciones'.")
+                page.screenshot(path=str(_sc_dir / "no_vacaciones_btn.png"))
+                log.error(f"  Screenshot: {_sc_dir / 'no_vacaciones_btn.png'}")
+                return None
+
+            vacaciones_btn.click()
+            try:
+                page.wait_for_load_state("networkidle", timeout=15_000)
+            except PlaywrightTimeout:
+                pass
+            time.sleep(2)
+            log.info(f"  URL vacaciones: {page.url}")
+            page.screenshot(path=str(_sc_dir / "vacations_page.png"))
+
+            # ── Buscar el botón de exportar iCal ──────────────────────────────
             ical_el = _find_ical_button(page)
-
-            # ── Intento 2: navegar via menú lateral ───────────────────────────
-            if not ical_el:
-                log.info("  Botón no encontrado en URL directa. Intentando via menú…")
-                for nav_sel in VACATIONS_NAV_SELECTORS:
-                    try:
-                        nav_el = page.wait_for_selector(nav_sel, timeout=3000, state="visible")
-                        if nav_el:
-                            nav_el.click()
-                            time.sleep(2)
-                            ical_el = _find_ical_button(page)
-                            if ical_el:
-                                break
-                    except PlaywrightTimeout:
-                        continue
 
             if not ical_el:
                 log.error("  ✗ No se encontró el botón 'Exportar iCal'.")
                 log.error("  → Usa --ical /ruta/Sesame-Calendar.ics para modo manual.")
-                # Screenshot de diagnóstico
-                try:
-                    from pathlib import Path as _P
-                    _sc = _user_dir / "screenshots" / "update_vacaciones_no_button.png"
-                    _sc.parent.mkdir(parents=True, exist_ok=True)
-                    page.screenshot(path=str(_sc))
-                    log.error(f"  Screenshot: {_sc}")
-                except Exception:
-                    pass
+                page.screenshot(path=str(_sc_dir / "update_vacaciones_no_button.png"))
+                log.error(f"  Screenshots en: {_sc_dir}")
                 return None
 
             # ── Descarga ──────────────────────────────────────────────────────
             log.info("  Iniciando descarga del iCal…")
+            # Intentar obtener el href y navegar directamente (más fiable que click)
+            href = ical_el.get_attribute("href")
             with page.expect_download(timeout=30_000) as dl_info:
-                ical_el.click(no_wait_after=True)
+                if href:
+                    # Es un enlace directo — navegar a él dispara la descarga
+                    from urllib.parse import urljoin
+                    full_url = urljoin(page.url, href)
+                    log.info(f"  href del enlace: {full_url}")
+                    page.evaluate(f"window.location.href = '{full_url}'"  )
+                else:
+                    # Sin href — click via JS (no espera navegación)
+                    page.evaluate("el => el.click()", ical_el)
             download = dl_info.value
             ical_path = Path(download.path())
             content = ical_path.read_text(encoding="utf-8")
