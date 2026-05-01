@@ -353,53 +353,71 @@ def download_ical_playwright() -> str | None:
                 return None
 
             vacaciones_btn.click()
+            # Esperar cambio de URL — NO usar networkidle (cuelga en VPS headless)
             try:
-                page.wait_for_load_state("domcontentloaded", timeout=15_000)
+                page.wait_for_url(lambda url: "vacation" in url.lower(), timeout=15_000)
             except PlaywrightTimeout:
                 pass
             time.sleep(3)
             log.info(f"  URL vacaciones: {page.url}")
 
-            # ── Buscar el botón de exportar iCal ──────────────────────────────
+            # ── Obtener URL del iCal via JS DOM (sin requisito de visibilidad) ──
+            # En headless/VPS la SPA puede no renderizar elementos visibles, pero
+            # el DOM sí tiene los hrefs. Buscamos el enlace directamente.
+            ical_url: str | None = page.evaluate("""
+                () => {
+                    const links = Array.from(document.querySelectorAll('a[href]'));
+                    const found = links.find(a =>
+                        a.href.includes('ical') ||
+                        a.href.includes('export_ical') ||
+                        a.href.endsWith('.ics')
+                    );
+                    return found ? found.href : null;
+                }
+            """)
+            if ical_url:
+                log.info(f"  URL iCal encontrada via JS DOM: {ical_url}")
 
-            if not ical_el:
-                # Diagnóstico: listar todos los enlaces y botones visibles
-                links = page.query_selector_all("a, button")
-                visible_links = []
-                for lnk in links:
+            # Fallback: wait_for_selector con state="attached" (en DOM, no visible)
+            if not ical_url:
+                for sel in ["a[href*='ical']", "a[href*='export_ical']", "a[href*='.ics']",
+                            "a:has-text('Exportar iCal')", "a:has-text('iCal')"]:
                     try:
-                        if lnk.is_visible():
-                            txt = lnk.inner_text().strip()[:60]
-                            href = lnk.get_attribute("href") or ""
-                            if txt or href:
-                                visible_links.append(f"  [{lnk.tag_name()}] {txt!r} href={href!r}")
-                    except Exception:
-                        pass
-                log.error("  ✗ No se encontró el botón 'Exportar iCal'.")
+                        el = page.wait_for_selector(sel, timeout=5000, state="attached")
+                        if el:
+                            href = el.get_attribute("href")
+                            if href:
+                                from urllib.parse import urljoin
+                                ical_url = urljoin(page.url, href)
+                                log.info(f"  URL iCal encontrada (attached): {ical_url}")
+                                break
+                    except PlaywrightTimeout:
+                        continue
+
+            if not ical_url:
+                # Diagnóstico: volcar todos los <a> del DOM (no solo visibles)
+                all_links: list = page.evaluate("""
+                    () => Array.from(document.querySelectorAll('a')).map(
+                        a => (a.getAttribute('href') || '') + ' | ' + a.innerText.slice(0, 60)
+                    )
+                """)
+                log.error("  ✗ No se encontró la URL del iCal.")
                 log.error(f"  URL actual: {page.url}")
-                log.error("  Elementos visibles en la página (a/button):")
-                for item in visible_links[:40]:
-                    log.error(item)
+                log.error(f"  Total <a> en DOM: {len(all_links)}")
+                for lnk in all_links[:40]:
+                    log.error(f"    {lnk}")
                 log.error("  → Usa --ical /ruta/Sesame-Calendar.ics para modo manual.")
                 return None
 
-            # ── Descarga ──────────────────────────────────────────────────────
-            log.info("  Iniciando descarga del iCal…")
-            # Intentar obtener el href y navegar directamente (más fiable que click)
-            href = ical_el.get_attribute("href")
-            with page.expect_download(timeout=30_000) as dl_info:
-                if href:
-                    # Es un enlace directo — navegar a él dispara la descarga
-                    from urllib.parse import urljoin
-                    full_url = urljoin(page.url, href)
-                    log.info(f"  href del enlace: {full_url}")
-                    page.evaluate(f"window.location.href = '{full_url}'"  )
-                else:
-                    # Sin href — click via JS (no espera navegación)
-                    page.evaluate("el => el.click()", ical_el)
-            download = dl_info.value
-            ical_path = Path(download.path())
-            content = ical_path.read_text(encoding="utf-8")
+            # ── Descargar iCal via HTTP con cookies de sesión ─────────────────
+            # Usamos context.request para reutilizar las cookies del login.
+            # Esto evita necesitar que el botón sea visible/clickable.
+            log.info(f"  Descargando {ical_url} …")
+            response = context.request.get(ical_url)
+            if not response.ok:
+                log.error(f"  HTTP {response.status} al descargar iCal")
+                return None
+            content = response.text()
             log.info(f"  ✓ iCal descargado ({len(content):,} bytes).")
             return content
 
