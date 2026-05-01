@@ -1,16 +1,5 @@
-# ─── Vacaciones de Jordi ──────────────────────────────────────────────────────
-# Formato:
-#   2026-04-23               → día suelto
-#   2026-08-03..2026-08-14   → rango (ambos extremos incluidos)
+# Este fichero se genera automáticamente cada día a las 05:00 por update_vacaciones.py
+# No editar manualmente — los cambios se sobreescribirán.
 #
-# Líneas en blanco y comentarios (#) se ignoran.
-# ─────────────────────────────────────────────────────────────────────────────
-
-# Semana Santa
-2026-04-02..2026-04-06
-
-# Verano
-2026-08-03..2026-08-21
-
-# Navidad
-2026-12-24..2026-12-31
+# Para regenerarlo ahora:
+#   /opt/sesame/venv/bin/python /opt/sesame/update_vacaciones.py --env /opt/sesame/users/jordi/.env
