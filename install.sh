@@ -1,7 +1,10 @@
 #!/usr/bin/env bash
 # install.sh – Instala sesame_auto en un VPS Debian/Ubuntu
 # ─────────────────────────────────────────────────────────────────────────────
-# Uso:  sudo bash install.sh
+# Uso:  bash install.sh
+#
+# Para actualizar tras un git pull:
+#   cd ~/sesame-auto-vps && git pull && bash install.sh
 #
 # Idempotente: puede ejecutarse varias veces sin problema.
 # Añadir un nuevo usuario = crear users/nombre/.env y re-ejecutar install.sh.
