@@ -1,10 +1,19 @@
 #!/usr/bin/env python3
 """
 sesame_auto.py – Fichaje automático para Sesame HR (vía navegador)
-===================================================================
+====================================================================
 Automatiza el fichaje en panel.sesametime.com usando Playwright.
 Inicia sesión con email/contraseña si la sesión ha caducado y pulsa
 el botón de fichaje (toggle: primera vez entra, segunda sale, etc.).
+
+Mejoras v2:
+  - File lock: solo un browser Playwright a la vez (evita colisiones entre usuarios)
+  - Verificación de estado: lee IN/OUT antes de clicar para evitar cascadas de errores
+  - Recuperación de estado: si un paso falla, los siguientes se adaptan al estado real
+  - Desfichaje garantizado: siempre se hace check_out al final del día
+  - Limpieza de sesión: invalida cookies si un intento falla
+  - Backoff exponencial en reintentos
+  - Limpieza de procesos Chromium huérfanos
 
 Horario diario:
   ~08:00  Check in
@@ -40,15 +49,19 @@ from playwright.sync_api import (
     sync_playwright,
 )
 
+try:
+    import fcntl
+    HAS_FCNTL = True
+except ImportError:
+    HAS_FCNTL = False
+
 # ── Carga del .env ────────────────────────────────────────────────────────────
-# Soporte multi-usuario: python sesame_auto.py --env users/alice/.env
 _env_arg = next((sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--env" and i + 1 < len(sys.argv)), None)
 _env_path = Path(_env_arg).resolve() if _env_arg else Path(__file__).parent / ".env"
 _user_dir = _env_path.parent
 load_dotenv(_env_path)
 
 def _resolve_path(env_var: str, default: str) -> Path:
-    """Resuelve rutas relativas respecto a _user_dir."""
     val = os.environ.get(env_var, default)
     p = Path(val)
     if not p.is_absolute():
@@ -69,19 +82,29 @@ TARGET_H         = float(os.environ.get("SESAME_TARGET_HOURS", "40.0"))
 HEADLESS         = os.environ.get("SESAME_HEADLESS", "true").lower() == "true"
 
 # Robustez: timeout y reintentos por fichaje
-MAX_CHECK_TIMEOUT_S = 8 * 60   # límite total por intento (8 min)
-MAX_RETRIES         = 2         # reintentos adicionales si falla
-RETRY_DELAY_S       = 3 * 60   # segundos entre reintentos
+MAX_CHECK_TIMEOUT_S = 8 * 60
+MAX_RETRIES         = 3
+RETRY_BASE_DELAY_S  = 3 * 60
+LOCK_TIMEOUT_S      = 15 * 60
+HARD_DEADLINE_H     = 19
+
+LOCK_FILE = Path(os.environ.get("SESAME_LOCK_FILE", "/tmp/sesame_playwright.lock"))
 
 CHECKS_URL  = "https://panel.sesametime.com/admin/users/checks"
 LOGIN_URL   = "https://panel.sesametime.com"
 
-# Horario objetivo y margen en minutos
 SCHEDULE = {
     "check_in":  dict(hour=8,  minute=0,  jitter=15),
     "lunch_out": dict(hour=13, minute=0,  jitter=15),
     "lunch_in":  dict(hour=14, minute=0,  jitter=15),
     "check_out": dict(hour=17, minute=0,  jitter=15),
+}
+
+STEP_TRANSITIONS = {
+    "check_in":  {"before_state": "OUT", "after_state": "IN"},
+    "lunch_out": {"before_state": "IN",  "after_state": "OUT"},
+    "lunch_in":  {"before_state": "OUT", "after_state": "IN"},
+    "check_out": {"before_state": "IN",  "after_state": "OUT"},
 }
 
 # ── Logging ───────────────────────────────────────────────────────────────────
@@ -102,6 +125,21 @@ log = logging.getLogger(__name__)
 
 # ── Selectores del navegador (con fallbacks por si la web cambia) ─────────────
 
+# Botón de fichaje: selector principal #check_button (basado en HTML real de Sesame)
+CHECK_BUTTON_PRIMARY = "#check_button"
+CHECK_BUTTON_FALLBACKS = [
+    "[data-testid='check-button']",
+    "[data-action*='check']",
+    "a:has-text('Check IN')",
+    "a:has-text('Check OUT')",
+    "button:has-text('Fichar')",
+    "button:has-text('Check')",
+    ".check-button",
+    "button.btn-check",
+    "[class*='checkin']",
+    "[class*='check-in']",
+]
+
 LOGIN_EMAIL_SELECTORS    = ["#UserEmail", 'input[name="email"]', 'input[type="email"]']
 LOGIN_PASSWORD_SELECTORS = ["#UserPassword", 'input[name="password"]', 'input[type="password"]']
 LOGIN_SUBMIT_SELECTORS   = [
@@ -113,19 +151,6 @@ LOGIN_SUBMIT_SELECTORS   = [
     "button:has-text('Login')",
 ]
 
-# Botón de fichar (toggle check in / check out)
-CHECK_BUTTON_SELECTORS = [
-    "#check_button",
-    "[data-testid='check-button']",
-    "[data-action*='check']",
-    "button:has-text('Fichar')",
-    "button:has-text('Check')",
-    ".check-button",
-    "button.btn-check",
-    "[class*='checkin']",
-    "[class*='check-in']",
-]
-
 # Confirmación tras pulsar el botón (alertas nativas o modales)
 CONFIRM_SELECTORS = [
     "button:has-text('Confirmar')",
@@ -135,6 +160,131 @@ CONFIRM_SELECTORS = [
     ".swal2-confirm",
     ".modal-footer button.btn-primary",
 ]
+
+
+# ── File Lock ──────────────────────────────────────────────────────────────────
+
+_lock_fd = None
+
+def _acquire_playwright_lock():
+    """Adquiere un file lock para serializar el uso de Playwright entre usuarios."""
+    global _lock_fd
+    LOCK_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+    if not HAS_FCNTL:
+        log.info("  fcntl no disponible (Windows) — saltando lock.")
+        return None
+
+    lock_fd = open(LOCK_FILE, "w")
+    deadline = time.time() + LOCK_TIMEOUT_S
+    while time.time() < deadline:
+        try:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _lock_fd = lock_fd
+            log.info(f"  🔒 Lock adquirido ({LOCK_FILE})")
+            return lock_fd
+        except (IOError, OSError):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                lock_fd.close()
+                raise TimeoutError(
+                    f"No se pudo adquirir lock tras {LOCK_TIMEOUT_S // 60} min — "
+                    f"otro usuario está usando el navegador?"
+                )
+            log.info(f"  ⏳ Esperando lock de Playwright… (quedan {remaining:.0f}s)")
+            time.sleep(15)
+    lock_fd.close()
+    raise TimeoutError(f"No se pudo adquirir lock tras {LOCK_TIMEOUT_S // 60} min")
+
+
+def _release_playwright_lock(lock_fd):
+    """Libera el file lock."""
+    global _lock_fd
+    if lock_fd is None:
+        return
+    try:
+        fcntl.flock(lock_fd, fcntl.LOCK_UN)
+    except Exception:
+        pass
+    try:
+        lock_fd.close()
+    except Exception:
+        pass
+    _lock_fd = None
+    log.info("  🔓 Lock liberado")
+
+
+# ── Estado del fichaje ─────────────────────────────────────────────────────────
+
+def _get_check_state(page: Page) -> str | None:
+    """
+    Lee el estado actual del usuario en Sesame.
+    Devuelve 'IN' (fichado, puede salir) o 'OUT' (desfichado, puede entrar).
+
+    Basado en el HTML real del botón #check_button:
+      <a id="check_button" class="... ssm-btn-checkout ...">Check OUT</a>
+        → usuario está IN, el botón permite salir
+      <a id="check_button" class="... ssm-btn-checkin ...">Check IN</a>
+        → usuario está OUT, el botón permite entrar
+    """
+    try:
+        btn = page.query_selector(CHECK_BUTTON_PRIMARY)
+        if not btn:
+            for sel in CHECK_BUTTON_FALLBACKS:
+                try:
+                    btn = page.query_selector(sel)
+                    if btn and btn.is_visible():
+                        break
+                except Exception:
+                    btn = None
+                    continue
+        if not btn:
+            log.warning("  No se encontró el botón de fichaje para leer estado.")
+            return None
+
+        classes = btn.get_attribute("class") or ""
+        text = btn.inner_text().strip().upper()
+
+        if "ssm-btn-checkout" in classes:
+            log.info(f"  Estado actual: IN (botón dice '{text}')")
+            return "IN"
+        if "ssm-btn-checkin" in classes:
+            log.info(f"  Estado actual: OUT (botón dice '{text}')")
+            return "OUT"
+
+        if "OUT" in text:
+            log.info(f"  Estado actual: IN (botón dice '{text}')")
+            return "IN"
+        if "IN" in text:
+            log.info(f"  Estado actual: OUT (botón dice '{text}')")
+            return "OUT"
+
+        log.warning(f"  No se pudo determinar estado. Clases: '{classes}', texto: '{text}'")
+        return None
+    except Exception as e:
+        log.warning(f"  Error leyendo estado: {e}")
+        return None
+
+
+# ── Limpieza ──────────────────────────────────────────────────────────────────
+
+def _kill_stale_chromium():
+    """Mata procesos Chromium huérfanos (solo se ejecuta con el lock adquirido)."""
+    try:
+        os.system("pkill -f 'chrome-headless-shell.*--no-sandbox' 2>/dev/null || true")
+        time.sleep(1)
+    except Exception:
+        pass
+
+
+def _invalidate_session():
+    """Borra browser_session.json para forzar login limpio en el próximo intento."""
+    try:
+        if SESSION_FILE.exists():
+            SESSION_FILE.unlink()
+            log.info("  🗑  Sesión invalidada (se forzará login limpio)")
+    except Exception as e:
+        log.debug(f"  No se pudo borrar sesión: {e}")
 
 
 # ── Automatización del navegador ──────────────────────────────────────────────
@@ -224,9 +374,12 @@ def _click_check_button(page: Page, action_label: str) -> bool:
     """Localiza y pulsa el botón de fichaje."""
     log.info(f"  Buscando botón de fichaje ({action_label})…")
 
-    btn = _first_visible(page, CHECK_BUTTON_SELECTORS, timeout=10000)
+    btn = None
+    try:
+        btn = page.wait_for_selector(CHECK_BUTTON_PRIMARY, timeout=10000, state="visible")
+    except PlaywrightTimeout:
+        pass
 
-    # Fallback: el botón puede estar dentro del dropdown "Acciones"
     if not btn:
         log.info("  Botón directo no encontrado. Probando dropdown 'Acciones'…")
         acciones_btn = _first_visible(page, [
@@ -246,6 +399,15 @@ def _click_check_button(page: Page, action_label: str) -> bool:
             ], timeout=5000)
 
     if not btn:
+        for sel in CHECK_BUTTON_FALLBACKS:
+            try:
+                btn = page.wait_for_selector(sel, timeout=3000, state="visible")
+                if btn:
+                    break
+            except PlaywrightTimeout:
+                continue
+
+    if not btn:
         log.error("  ✗ No se encontró el botón de fichaje.")
         _take_screenshot(page, f"no_button_{action_label}")
         return False
@@ -259,7 +421,6 @@ def _click_check_button(page: Page, action_label: str) -> bool:
     try:
         btn.click(timeout=15_000)
     except PlaywrightTimeout:
-        # El click se realizó; el timeout fue en la espera de navegación post-click.
         log.warning("  ⚠ Timeout post-click — el fichaje probablemente se completó igualmente.")
         _take_screenshot(page, f"click_timeout_{action_label}")
     time.sleep(1.5)
@@ -277,85 +438,204 @@ def _click_check_button(page: Page, action_label: str) -> bool:
             continue
 
     _take_screenshot(page, f"after_{action_label}")
-    log.info(f"  ✓ Fichaje '{action_label}' realizado.")
+    log.info(f"  ✓ Fichaje '{action_label}' pulsado.")
     return True
 
 
-def do_check(action_label: str) -> bool:
+def do_check(action_label: str, expected_before: str = None, expected_after: str = None) -> bool:
     """
     Abre Playwright, inicia sesión si es necesario y pulsa el botón de fichaje.
     action_label es solo informativo (check_in / lunch_out / lunch_in / check_out).
+
+    Con verificación de estado:
+      - Lee el estado IN/OUT antes de clicar
+      - Si el estado ya es el esperado tras el fichaje, saltea
+      - Si el estado es inesperado, intenta recuperación (doble click)
+      - Verifica el estado después de clicar
     """
     if DRY_RUN:
         log.info(f"  [DRY RUN] Simular fichaje: {action_label}")
         return True
 
-    with sync_playwright() as pw:
-        browser: Browser = pw.chromium.launch(
-            headless=HEADLESS,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-gpu",
-                "--disable-extensions",
-            ],
-        )
+    lock_fd = None
 
-        ctx_kwargs: dict = {
-            "viewport": {"width": 1280, "height": 720},
-            "user_agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "locale": "es-ES",
-        }
-        if SESSION_FILE.exists():
-            ctx_kwargs["storage_state"] = str(SESSION_FILE)
+    try:
+        lock_fd = _acquire_playwright_lock()
+    except TimeoutError as e:
+        log.error(f"  ✗ {e}")
+        return False
 
-        context: BrowserContext = browser.new_context(**ctx_kwargs)
-        page: Page = context.new_page()
-        page.set_default_navigation_timeout(90_000)  # 90 s máx para cualquier goto
-        page.set_default_timeout(30_000)             # 30 s máx para selectores
+    try:
+        _kill_stale_chromium()
 
-        try:
-            log.info(f"  Navegando a {CHECKS_URL} …")
-            page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=90_000)
-            time.sleep(2)
+        with sync_playwright() as pw:
+            browser: Browser = pw.chromium.launch(
+                headless=HEADLESS,
+                args=[
+                    "--no-sandbox",
+                    "--disable-dev-shm-usage",
+                    "--disable-gpu",
+                    "--disable-extensions",
+                ],
+            )
 
-            if _needs_login(page):
-                log.info("  Sesión no activa, haciendo login…")
-                page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=15000)
-                time.sleep(1)
-                if not _do_login(page):
-                    return False
-                page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=30000)
+            ctx_kwargs: dict = {
+                "viewport": {"width": 1280, "height": 720},
+                "user_agent": (
+                    "Mozilla/5.0 (X11; Linux x86_64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0.0.0 Safari/537.36"
+                ),
+                "locale": "es-ES",
+            }
+            if SESSION_FILE.exists():
+                ctx_kwargs["storage_state"] = str(SESSION_FILE)
+
+            context: BrowserContext = browser.new_context(**ctx_kwargs)
+            page: Page = context.new_page()
+            page.set_default_navigation_timeout(60_000)
+            page.set_default_timeout(30_000)
+
+            try:
+                log.info(f"  Navegando a {CHECKS_URL} …")
+                page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=60_000)
                 time.sleep(2)
 
-            # Guardar cookies / sesión actualizada
-            SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
-            context.storage_state(path=str(SESSION_FILE))
+                if _needs_login(page):
+                    log.info("  Sesión no activa, haciendo login…")
+                    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=15000)
+                    time.sleep(1)
+                    if not _do_login(page):
+                        _invalidate_session()
+                        return False
+                    page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=30000)
+                    time.sleep(2)
 
-            return _click_check_button(page, action_label)
+                # Guardar cookies / sesión actualizada
+                SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+                context.storage_state(path=str(SESSION_FILE))
 
-        except Exception as e:
-            log.error(f"  ✗ Error inesperado en do_check({action_label}): {e}")
-            _take_screenshot(page, f"error_{action_label}")
-            return False
+                # ── Verificación de estado ANTES de fichar ──────────────
+                recovery_done = False
+                current_state = _get_check_state(page)
 
-        finally:
-            context.close()
-            browser.close()
+                if current_state and expected_before and expected_after:
+
+                    if current_state == expected_after:
+                        log.info(f"  ✅ Ya en estado {expected_after} — no hace falta fichar.")
+                        return True
+
+                    if current_state != expected_before:
+                        log.warning(
+                            f"  ⚠ Estado inesperado para {action_label}: "
+                            f"esperaba {expected_before}, encontré {current_state}. "
+                            f"Objetivo: llegar a {expected_after}."
+                        )
+
+                        # Recuperación: necesitamos llegar a expected_after
+                        if current_state == "OUT" and expected_after == "OUT":
+                            # Estamos OUT y necesitamos terminar OUT (ej: check_out pero estamos en comida)
+                            # Primero Check IN, luego Check OUT
+                            log.warning("  🔧 Recuperación: haciendo Check IN primero (estamos en comida)…")
+                            if not _click_check_button(page, f"recovery_in_{action_label}"):
+                                _invalidate_session()
+                                return False
+                            time.sleep(3)
+                            page.reload(wait_until="domcontentloaded", timeout=30000)
+                            time.sleep(2)
+                            new_state = _get_check_state(page)
+                            if new_state != "IN":
+                                log.error(f"  ❌ Recuperación falló: estado={new_state}, esperaba IN")
+                                _invalidate_session()
+                                return False
+                            log.info("  ✅ Ahora estamos IN. Procediendo con el fichaje…")
+                            recovery_done = True
+
+                        elif current_state == "IN" and expected_after == "IN":
+                            # Estamos IN y necesitamos terminar IN (ej: lunch_in pero nunca salimos)
+                            # Primero Check OUT, luego Check IN
+                            log.warning("  🔧 Recuperación: haciendo Check OUT primero (nunca salimos a comer)…")
+                            if not _click_check_button(page, f"recovery_out_{action_label}"):
+                                _invalidate_session()
+                                return False
+                            time.sleep(3)
+                            page.reload(wait_until="domcontentloaded", timeout=30000)
+                            time.sleep(2)
+                            new_state = _get_check_state(page)
+                            if new_state != "OUT":
+                                log.error(f"  ❌ Recuperación falló: estado={new_state}, esperaba OUT")
+                                _invalidate_session()
+                                return False
+                            log.info("  ✅ Ahora estamos OUT. Procediendo con el fichaje…")
+                            recovery_done = True
+
+                    elif current_state == "IN" and expected_after == "OUT":
+                        log.info(f"  Estado correcto para fichar salida ({current_state} → {expected_after})")
+
+                    elif current_state == "OUT" and expected_after == "IN":
+                        log.info(f"  Estado correcto para fichar entrada ({current_state} → {expected_after})")
+
+                # ── Clicar el botón ──────────────────────────────────────
+                if not _click_check_button(page, action_label):
+                    _invalidate_session()
+                    return False
+
+                time.sleep(2)
+
+                # ── Verificación de estado DESPUÉS de fichar ─────────────
+                if expected_after:
+                    try:
+                        page.reload(wait_until="domcontentloaded", timeout=30000)
+                        time.sleep(2)
+                    except Exception:
+                        time.sleep(3)
+
+                    new_state = _get_check_state(page)
+                    if new_state == expected_after:
+                        log.info(f"  ✅ Estado verificado tras fichaje: {new_state} (correcto)")
+                    elif new_state:
+                        log.warning(
+                            f"  ⚠ Estado tras fichaje: {new_state} "
+                            f"(esperaba {expected_after})"
+                        )
+                        try:
+                            page.reload(wait_until="domcontentloaded", timeout=30000)
+                            time.sleep(2)
+                        except Exception:
+                            pass
+                        new_state2 = _get_check_state(page)
+                        if new_state2 == expected_after:
+                            log.info(f"  ✅ Estado verificado tras reload: {new_state2}")
+                        else:
+                            log.warning(f"  Estado final: {new_state2} (esperaba {expected_after})")
+
+                # Guardar sesión actualizada
+                context.storage_state(path=str(SESSION_FILE))
+                return True
+
+            except Exception as e:
+                log.error(f"  ✗ Error inesperado en do_check({action_label}): {e}")
+                _take_screenshot(page, f"error_{action_label}")
+                _invalidate_session()
+                return False
+
+            finally:
+                context.close()
+                browser.close()
+
+    finally:
+        if lock_fd:
+            _release_playwright_lock(lock_fd)
 
 
-def do_check_with_timeout(action_label: str) -> bool:
+def do_check_with_timeout(action_label: str, expected_before: str = None, expected_after: str = None) -> bool:
     """
     Ejecuta do_check con un límite de MAX_CHECK_TIMEOUT_S segundos.
     Si Playwright se queda colgado (por ejemplo, página muy lenta),
     el futuro expira y se devuelve False para que el llamador pueda reintentar.
     """
     with ThreadPoolExecutor(max_workers=1) as executor:
-        future = executor.submit(do_check, action_label)
+        future = executor.submit(do_check, action_label, expected_before, expected_after)
         try:
             return future.result(timeout=MAX_CHECK_TIMEOUT_S)
         except FuturesTimeout:
@@ -363,6 +643,12 @@ def do_check_with_timeout(action_label: str) -> bool:
                 f"  ✗ do_check({action_label}) superó el límite de "
                 f"{MAX_CHECK_TIMEOUT_S // 60} min. Abortando intento."
             )
+            global _lock_fd
+            if _lock_fd:
+                _release_playwright_lock(_lock_fd)
+                _lock_fd = None
+            _invalidate_session()
+            _kill_stale_chromium()
             return False
         except Exception as e:
             log.error(f"  ✗ Excepción en do_check({action_label}): {e}")
@@ -447,11 +733,11 @@ def build_schedule(tz, week_hours: float) -> dict:
     La hora de salida se ajusta para alcanzar el objetivo semanal.
     """
     today = date.today()
-    days_left = 5 - today.weekday()  # días laborables restantes incluyendo hoy
+    days_left = 5 - today.weekday()
 
     # Horas objetivo para hoy
     target_today = (TARGET_H - week_hours) / max(days_left, 1)
-    target_today = max(6.5, min(9.5, target_today))  # límite razonable
+    target_today = max(6.5, min(9.5, target_today))
 
     t_in  = _jittered(**SCHEDULE["check_in"],  tz=tz)
     t_lo  = _jittered(**SCHEDULE["lunch_out"], tz=tz)
@@ -507,7 +793,7 @@ def is_vacation_day(day: date) -> bool:
         return False
 
     for raw in VACACIONES_FILE.read_text(encoding="utf-8").splitlines():
-        line = raw.split("#")[0].strip()   # quitar comentarios inline
+        line = raw.split("#")[0].strip()
         if not line:
             continue
         try:
@@ -555,7 +841,7 @@ def main():
 
     # No hacer nada en días de vacaciones
     if is_vacation_day(today):
-        log.info(f"🏖️  Hoy ({today.isoformat()}) es día de vacaciones. No se ficha.")
+        log.info(f"  Hoy ({today.isoformat()}) es día de vacaciones. No se ficha.")
         return
 
     log.info("=" * 55)
@@ -591,6 +877,8 @@ def main():
 
     check_in_time  = None
     check_out_time = None
+    lunch_out_done = False
+    lunch_in_done  = False
 
     for step_name, action_label in steps:
         if is_done(state, step_name):
@@ -600,13 +888,17 @@ def main():
                 check_in_time = datetime.fromisoformat(actual).replace(tzinfo=tz)
             elif step_name == "check_out" and actual:
                 check_out_time = datetime.fromisoformat(actual).replace(tzinfo=tz)
+            elif step_name == "lunch_out":
+                lunch_out_done = True
+            elif step_name == "lunch_in":
+                lunch_in_done = True
             continue
 
         target_dt = datetime.fromisoformat(sched[step_name]).replace(tzinfo=tz)
         now = datetime.now(tz)
 
-        # Si el momento ya pasó hace >45 min, omitir
-        if target_dt < now - timedelta(minutes=45):
+        # Si el momento ya pasó hace >45 min, omitir (excepto check_out)
+        if target_dt < now - timedelta(minutes=45) and step_name != "check_out":
             log.warning(
                 f"  {step_name}: la hora programada ({target_dt.strftime('%H:%M')}) "
                 "pasó hace >45 min — omitiendo."
@@ -615,17 +907,23 @@ def main():
 
         _sleep_until(target_dt)
 
+        transition = STEP_TRANSITIONS.get(step_name, {})
+        expected_before = transition.get("before_state")
+        expected_after = transition.get("after_state")
+
         success = False
         for attempt in range(MAX_RETRIES + 1):
             if attempt > 0:
+                backoff = min(RETRY_BASE_DELAY_S * (2 ** (attempt - 1)), 30 * 60)
                 log.warning(
-                    f"  🔄 Reintentando {step_name} en {RETRY_DELAY_S // 60} min "
+                    f"  🔄 Reintentando {step_name} en {backoff // 60} min "
                     f"(intento {attempt + 1}/{MAX_RETRIES + 1})…"
                 )
-                time.sleep(RETRY_DELAY_S)
-            success = do_check_with_timeout(action_label)
+                time.sleep(backoff)
+            success = do_check_with_timeout(action_label, expected_before, expected_after)
             if success:
                 break
+
         actual_now = datetime.now(tz)
 
         if success:
@@ -634,21 +932,60 @@ def main():
                 check_in_time = actual_now
             elif step_name == "check_out":
                 check_out_time = actual_now
+            elif step_name == "lunch_out":
+                lunch_out_done = True
+            elif step_name == "lunch_in":
+                lunch_in_done = True
         else:
             log.error(f"  ⚠️  {step_name} FALLÓ. Revisa screenshots en {SCREENSHOT_DIR}")
 
-    # Actualizar contador semanal de horas
+    # ── GARANTÍA: El usuario DEBE estar desfichado (OUT) al final del día ────
+    if not is_done(state, "check_out") and check_out_time is None:
+        log.warning("  ⚠️  check_out no se completó. Intentando garantía de desfichaje…")
+
+        hard_deadline = datetime.now(tz).replace(hour=HARD_DEADLINE_H, minute=0, second=0)
+        attempt = 0
+        while datetime.now(tz) < hard_deadline:
+            attempt += 1
+            log.info(f"  🔄 Intento de garantía check_out #{attempt}…")
+            success = do_check_with_timeout("check_out_guarantee", "IN", "OUT")
+            if success:
+                actual_now = datetime.now(tz)
+                mark_done(state, "check_out", actual_now.isoformat())
+                check_out_time = actual_now
+                log.info("  ✅ Garantía de desfichaje completada.")
+                break
+            remaining = hard_deadline - datetime.now(tz)
+            if remaining.total_seconds() > 300:
+                time.sleep(300)
+
+        if check_out_time is None:
+            log.error("  ❌ No se pudo garantizar el desfichaje. INTERVENCIÓN MANUAL NECESARIA.")
+
+    # ── Actualizar contador semanal de horas ──────────────────────────────────
     if check_in_time and check_out_time:
-        lunch_h = (
-            datetime.fromisoformat(sched["lunch_in"]).replace(tzinfo=tz)
-            - datetime.fromisoformat(sched["lunch_out"]).replace(tzinfo=tz)
-        ).total_seconds() / 3600
+        lunch_h = 0.0
+        if lunch_out_done and lunch_in_done:
+            lunch_h = (
+                datetime.fromisoformat(sched["lunch_in"]).replace(tzinfo=tz)
+                - datetime.fromisoformat(sched["lunch_out"]).replace(tzinfo=tz)
+            ).total_seconds() / 3600
+        elif lunch_out_done and not lunch_in_done:
+            log.warning("  ⚠ lunch_in falló — no se resta tiempo de comida (estuvo OUT más tiempo del previsto).")
+            lunch_h = 0.0
+        else:
+            if not lunch_out_done and not lunch_in_done:
+                log.warning("  ⚠ Sin pausa de comida registrada — no se resta nada.")
+            lunch_h = 0.0
+
         worked = (check_out_time - check_in_time).total_seconds() / 3600 - lunch_h
         add_week_hours(state, worked)
         log.info(
             f"Horas trabajadas hoy: {worked:.2f} h  "
             f"|  Total semana: {get_week_hours(state):.2f} h / {TARGET_H} h"
         )
+    else:
+        log.warning("  No se pudo calcular horas: falta check_in o check_out.")
 
     log.info("=" * 55)
     log.info("  sesame_auto finalizado")

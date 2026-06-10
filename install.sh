@@ -108,15 +108,29 @@ NEW_CRON_LINES=""
 # La línea TZ= en crontab fija la zona horaria para todos los jobs siguientes.
 # Sin esto, cron usa UTC del servidor y el script ficharía 2h tarde en verano.
 NEW_CRON_LINES=$'\nTZ=Europe/Madrid'
-for username in "${FOUND_USERS[@]}"; do
+
+# Horarios escalonados para evitar que dos usuarios lancen Playwright a la vez
+# User 1 → 05:30, User 2 → 05:45, User 3 → 06:00, etc.
+_STAGGER_MINUTES=30
+for i in "${!FOUND_USERS[@]}"; do
+    username="${FOUND_USERS[$i]}"
     ENV_PATH="$INSTALL_DIR/users/$username/.env"
     LOG_AUTO="$INSTALL_DIR/users/$username/sesame_auto.log"
     LOG_VAC="$INSTALL_DIR/users/$username/update_vacaciones.log"
-    # Fichaje diario: lunes a viernes a las 05:30
-    CRON_LINE="30 5 * * 1-5 $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $ENV_PATH >> $LOG_AUTO 2>&1"
+
+    CRON_MINUTE=$((_STAGGER_MINUTES + i * 15))
+    CRON_HOUR=5
+    if [ "$CRON_MINUTE" -ge 60 ]; then
+        CRON_MINUTE=$((CRON_MINUTE - 60))
+        CRON_HOUR=6
+    fi
+
+    # Fichaje diario: lunes a viernes, escalonado
+    CRON_LINE="$CRON_MINUTE $CRON_HOUR * * 1-5 $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $ENV_PATH >> $LOG_AUTO 2>&1"
     NEW_CRON_LINES="$NEW_CRON_LINES"$'\n'"$CRON_LINE"
-    echo "   ✔ Cron '$username': L-V 05:30 Madrid → sesame_auto.py (log: $LOG_AUTO)"
-    # Actualización diaria de vacaciones: cada día a las 05:00, antes del fichaje de las 05:30
+    echo "   ✔ Cron '$username': L-V $CRON_HOUR:$(printf '%02d' $CRON_MINUTE) Madrid → sesame_auto.py (log: $LOG_AUTO)"
+
+    # Actualización diaria de vacaciones: siempre a las 05:00
     CRON_VAC="0 5 * * * $VENV_DIR/bin/python $INSTALL_DIR/update_vacaciones.py --env $ENV_PATH >> $LOG_VAC 2>&1"
     NEW_CRON_LINES="$NEW_CRON_LINES"$'\n'"$CRON_VAC"
     echo "   ✔ Cron '$username': diario 05:00 → update_vacaciones.py (log: $LOG_VAC)"

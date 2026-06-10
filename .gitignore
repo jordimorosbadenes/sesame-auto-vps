@@ -10,3 +10,4 @@ users/**/state.json
 users/**/browser_session*.json
 users/**/screenshots*/
 users/**/screenshots_test/
+.opencode/

@@ -131,12 +131,21 @@ def dates_to_vacaciones(dates: list) -> str:
     Convierte lista de fechas ordenadas al formato de vacaciones.txt.
     Agrupa días consecutivos en rangos (2026-08-01..2026-08-14).
     """
+    regen_path = _env_path if _env_path else Path(__file__).parent / ".env"
+
     if not dates:
-        return f"# Generado automáticamente – {date.today().isoformat()}\n# (sin días no laborables)\n"
+        return (
+            f"# Generado automáticamente desde Sesame iCal – {date.today().isoformat()}\n"
+            f"# Para regenerar ahora:\n"
+            f"#   python {__file__} --env {regen_path}\n"
+            f"# (sin días no laborables)\n"
+        )
 
     lines = [
         f"# Generado automáticamente desde Sesame iCal – {date.today().isoformat()}",
         "# Festivos laborables + vacaciones propias (fines de semana excluidos)",
+        f"# Para regenerar ahora:",
+        f"#   python {__file__} --env {regen_path}",
         "",
     ]
 
