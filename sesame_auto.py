@@ -82,7 +82,7 @@ TARGET_H         = float(os.environ.get("SESAME_TARGET_HOURS", "40.0"))
 HEADLESS         = os.environ.get("SESAME_HEADLESS", "true").lower() == "true"
 
 # Robustez: timeout y reintentos por fichaje
-MAX_CHECK_TIMEOUT_S = 8 * 60
+MAX_CHECK_TIMEOUT_S = 15 * 60  # 15 min por intento (la navegación posterior al click puede ser lenta)
 MAX_RETRIES         = 3
 RETRY_BASE_DELAY_S  = 3 * 60
 LOCK_TIMEOUT_S      = 15 * 60
@@ -228,6 +228,8 @@ def _get_check_state(page: Page) -> str | None:
         → usuario está OUT, el botón permite entrar
     """
     try:
+        # Esperar a que la página esté estable antes de leer el estado
+        _wait_page_stable(page, timeout_s=8)
         btn = page.query_selector(CHECK_BUTTON_PRIMARY)
         if not btn:
             for sel in CHECK_BUTTON_FALLBACKS:
@@ -268,6 +270,64 @@ def _get_check_state(page: Page) -> str | None:
 
 # ── Limpieza ──────────────────────────────────────────────────────────────────
 
+def _quick_check_current_state(tz) -> str | None:
+    """
+    Abre un navegador rápido, lee el estado actual en Sesame y cierra.
+    Devuelve 'IN', 'OUT' o None si no se pudo determinar.
+    """
+    if DRY_RUN:
+        return None
+    lock_fd = None
+    try:
+        lock_fd = _acquire_playwright_lock()
+    except TimeoutError:
+        log.warning("  No se pudo adquirir lock para verificación de estado.")
+        return None
+
+    try:
+        _kill_stale_chromium()
+        with sync_playwright() as pw:
+            browser = pw.chromium.launch(
+                headless=HEADLESS,
+                args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions"],
+            )
+            ctx_kwargs = {
+                "viewport": {"width": 1280, "height": 720},
+                "user_agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/124.0.0.0 Safari/537.36",
+                "locale": "es-ES",
+            }
+            if SESSION_FILE.exists():
+                ctx_kwargs["storage_state"] = str(SESSION_FILE)
+
+            context = browser.new_context(**ctx_kwargs)
+            page = context.new_page()
+            page.set_default_navigation_timeout(30_000)
+            page.set_default_timeout(15_000)
+
+            try:
+                page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=30_000)
+                time.sleep(2)
+
+                if _needs_login(page):
+                    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=15_000)
+                    time.sleep(1)
+                    if not _do_login(page):
+                        _invalidate_session()
+                        return None
+                    page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=30_000)
+                    time.sleep(2)
+
+                return _get_check_state(page)
+            except Exception:
+                return None
+            finally:
+                context.close()
+                browser.close()
+    finally:
+        if lock_fd:
+            _release_playwright_lock(lock_fd)
+
+
 def _kill_stale_chromium():
     """Mata procesos Chromium huérfanos (solo se ejecuta con el lock adquirido)."""
     try:
@@ -289,13 +349,22 @@ def _invalidate_session():
 
 # ── Automatización del navegador ──────────────────────────────────────────────
 
+def _wait_page_stable(page: Page, timeout_s: int = 10):
+    """Espera a que la página esté estable (DOM cargado + network idle)."""
+    try:
+        page.wait_for_load_state("domcontentloaded", timeout=timeout_s * 1000)
+        page.wait_for_load_state("networkidle", timeout=timeout_s * 1000)
+    except Exception:
+        pass
+
+
 def _take_screenshot(page: Page, label: str):
-    """Guarda un screenshot para debug."""
+    """Guarda un screenshot para debug (con timeout para no colgarse si la página navega)."""
     try:
         SCREENSHOT_DIR.mkdir(parents=True, exist_ok=True)
         ts   = datetime.now().strftime("%Y%m%d_%H%M%S")
         path = SCREENSHOT_DIR / f"{ts}_{label}.png"
-        page.screenshot(path=str(path))
+        page.screenshot(path=str(path), timeout=5000)
         log.info(f"  📷 Screenshot: {path}")
     except Exception as e:
         log.debug(f"  Screenshot fallido: {e}")
@@ -413,17 +482,21 @@ def _click_check_button(page: Page, action_label: str) -> bool:
         return False
 
     btn_text = btn.inner_text().strip()
-    log.info(f"  Botón encontrado: '{btn_text}'. Pulsando…")
+    btn_class = (btn.get_attribute("class") or "").strip()
+    log.info(f"  Botón encontrado: '{btn_text}'  [class: {btn_class}]")
     _take_screenshot(page, f"before_{action_label}")
 
     # Interceptar alert nativo antes del click
     page.once("dialog", lambda d: d.accept())
     try:
-        btn.click(timeout=15_000)
+        # no_wait_after=True: el <a href> navega tras el confirm, NO esperamos a que termine
+        btn.click(timeout=10_000, no_wait_after=True)
     except PlaywrightTimeout:
-        log.warning("  ⚠ Timeout post-click — el fichaje probablemente se completó igualmente.")
+        log.warning("  ⚠ Timeout en click — el fichaje probablemente se completó igualmente.")
         _take_screenshot(page, f"click_timeout_{action_label}")
-    time.sleep(1.5)
+    # Esperar a que la página termine de navegar tras el click
+    _wait_page_stable(page, timeout_s=15)
+    time.sleep(1)
 
     # Confirmar modal si aparece (ej. SweetAlert2)
     for sel in CONFIRM_SELECTORS:
@@ -497,9 +570,11 @@ def do_check(action_label: str, expected_before: str = None, expected_after: str
             page.set_default_timeout(30_000)
 
             try:
+                _do_check_start = time.time()
                 log.info(f"  Navegando a {CHECKS_URL} …")
                 page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=60_000)
                 time.sleep(2)
+                log.info(f"  URL actual: {page.url}")
 
                 if _needs_login(page):
                     log.info("  Sesión no activa, haciendo login…")
@@ -518,6 +593,9 @@ def do_check(action_label: str, expected_before: str = None, expected_after: str
                 # ── Verificación de estado ANTES de fichar ──────────────
                 recovery_done = False
                 current_state = _get_check_state(page)
+
+                if current_state:
+                    log.info(f"  URL: {page.url}")
 
                 if current_state and expected_before and expected_after:
 
@@ -540,9 +618,7 @@ def do_check(action_label: str, expected_before: str = None, expected_after: str
                             if not _click_check_button(page, f"recovery_in_{action_label}"):
                                 _invalidate_session()
                                 return False
-                            time.sleep(3)
-                            page.reload(wait_until="domcontentloaded", timeout=30000)
-                            time.sleep(2)
+                            _wait_page_stable(page, timeout_s=15)
                             new_state = _get_check_state(page)
                             if new_state != "IN":
                                 log.error(f"  ❌ Recuperación falló: estado={new_state}, esperaba IN")
@@ -558,9 +634,7 @@ def do_check(action_label: str, expected_before: str = None, expected_after: str
                             if not _click_check_button(page, f"recovery_out_{action_label}"):
                                 _invalidate_session()
                                 return False
-                            time.sleep(3)
-                            page.reload(wait_until="domcontentloaded", timeout=30000)
-                            time.sleep(2)
+                            _wait_page_stable(page, timeout_s=15)
                             new_state = _get_check_state(page)
                             if new_state != "OUT":
                                 log.error(f"  ❌ Recuperación falló: estado={new_state}, esperaba OUT")
@@ -583,13 +657,10 @@ def do_check(action_label: str, expected_before: str = None, expected_after: str
                 time.sleep(2)
 
                 # ── Verificación de estado DESPUÉS de fichar ─────────────
+                # NO hacer page.reload() - la página ya navegó tras el click del <a href>
+                # Solo esperar a que se estabilice y leer el estado actual
                 if expected_after:
-                    try:
-                        page.reload(wait_until="domcontentloaded", timeout=30000)
-                        time.sleep(2)
-                    except Exception:
-                        time.sleep(3)
-
+                    _wait_page_stable(page, timeout_s=15)
                     new_state = _get_check_state(page)
                     if new_state == expected_after:
                         log.info(f"  ✅ Estado verificado tras fichaje: {new_state} (correcto)")
@@ -598,19 +669,17 @@ def do_check(action_label: str, expected_before: str = None, expected_after: str
                             f"  ⚠ Estado tras fichaje: {new_state} "
                             f"(esperaba {expected_after})"
                         )
-                        try:
-                            page.reload(wait_until="domcontentloaded", timeout=30000)
-                            time.sleep(2)
-                        except Exception:
-                            pass
+                        _wait_page_stable(page, timeout_s=8)
                         new_state2 = _get_check_state(page)
                         if new_state2 == expected_after:
-                            log.info(f"  ✅ Estado verificado tras reload: {new_state2}")
+                            log.info(f"  ✅ Estado verificado (segundo intento): {new_state2}")
                         else:
                             log.warning(f"  Estado final: {new_state2} (esperaba {expected_after})")
 
                 # Guardar sesión actualizada
                 context.storage_state(path=str(SESSION_FILE))
+                elapsed = time.time() - _do_check_start
+                log.info(f"  ⏱  Fichaje completado en {elapsed:.0f}s")
                 return True
 
             except Exception as e:
@@ -879,6 +948,8 @@ def main():
     check_out_time = None
     lunch_out_done = False
     lunch_in_done  = False
+    # Tracking de pasos que realmente se ejecutaron (no solo marcados como done)
+    last_step_success = True
 
     for step_name, action_label in steps:
         if is_done(state, step_name):
@@ -904,6 +975,42 @@ def main():
                 "pasó hace >45 min — omitiendo."
             )
             continue
+
+        # Si el paso anterior falló pero realmente funcionó en Sesame, recuperar
+        if not last_step_success:
+            log.info(f"  Verificando estado real tras paso anterior…")
+            actual_state = _quick_check_current_state(tz)
+            if actual_state:
+                prev_step = steps[steps.index((step_name, action_label)) - 1] if steps.index((step_name, action_label)) > 0 else None
+                if prev_step:
+                    prev_name = prev_step[0]
+                    prev_transition = STEP_TRANSITIONS.get(prev_name, {})
+                    prev_expected_after = prev_transition.get("after_state")
+                    if prev_expected_after and actual_state == prev_expected_after:
+                        log.info(f"  ✅ Paso anterior '{prev_name}' realmente funcionó (estado={actual_state}). Recuperando.")
+                        # Marcar como completado y actualizar variables
+                        mark_done(state, prev_name, datetime.now(tz).isoformat())
+                        if prev_name == "check_in":
+                            check_in_time = datetime.now(tz)
+                        elif prev_name == "lunch_out":
+                            lunch_out_done = True
+                        elif prev_name == "lunch_in":
+                            lunch_in_done = True
+                        last_step_success = True
+                    # También verificar si ya estamos en el estado esperado para este paso
+                    this_transition = STEP_TRANSITIONS.get(step_name, {})
+                    if this_transition.get("after_state") == actual_state:
+                        log.info(f"  ✅ Ya en estado {actual_state} para '{step_name}'. Saltando.")
+                        mark_done(state, step_name, datetime.now(tz).isoformat())
+                        if step_name == "check_in":
+                            check_in_time = datetime.now(tz)
+                        elif step_name == "check_out":
+                            check_out_time = datetime.now(tz)
+                        elif step_name == "lunch_out":
+                            lunch_out_done = True
+                        elif step_name == "lunch_in":
+                            lunch_in_done = True
+                        continue
 
         _sleep_until(target_dt)
 
@@ -936,8 +1043,10 @@ def main():
                 lunch_out_done = True
             elif step_name == "lunch_in":
                 lunch_in_done = True
+            last_step_success = True
         else:
             log.error(f"  ⚠️  {step_name} FALLÓ. Revisa screenshots en {SCREENSHOT_DIR}")
+            last_step_success = False
 
     # ── GARANTÍA: El usuario DEBE estar desfichado (OUT) al final del día ────
     if not is_done(state, "check_out") and check_out_time is None:
@@ -948,13 +1057,31 @@ def main():
         while datetime.now(tz) < hard_deadline:
             attempt += 1
             log.info(f"  🔄 Intento de garantía check_out #{attempt}…")
-            success = do_check_with_timeout("check_out_guarantee", "IN", "OUT")
-            if success:
+            # Leer estado actual real: si ya está OUT, no hacer nada
+            actual_state = _quick_check_current_state(tz)
+            if actual_state == "OUT":
+                log.info("  ✅ Ya está desfichado (OUT). Marcando como completado.")
                 actual_now = datetime.now(tz)
                 mark_done(state, "check_out", actual_now.isoformat())
                 check_out_time = actual_now
-                log.info("  ✅ Garantía de desfichaje completada.")
                 break
+            elif actual_state == "IN":
+                success = do_check_with_timeout("check_out_guarantee", "IN", "OUT")
+                if success:
+                    actual_now = datetime.now(tz)
+                    mark_done(state, "check_out", actual_now.isoformat())
+                    check_out_time = actual_now
+                    log.info("  ✅ Garantía de desfichaje completada.")
+                    break
+            else:
+                # No se pudo determinar estado - intentar fichaje a ciegas
+                success = do_check_with_timeout("check_out_guarantee")
+                if success:
+                    actual_now = datetime.now(tz)
+                    mark_done(state, "check_out", actual_now.isoformat())
+                    check_out_time = actual_now
+                    log.info("  ✅ Garantía de desfichaje completada.")
+                    break
             remaining = hard_deadline - datetime.now(tz)
             if remaining.total_seconds() > 300:
                 time.sleep(300)
