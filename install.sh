@@ -57,9 +57,10 @@ mkdir -p "$INSTALL_DIR"
 echo "[ 3/6 ] Copiando scripts…"
 cp "$SCRIPT_DIR/sesame_auto.py"       "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/update_vacaciones.py" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/test_check_http.py"   "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/requirements.txt"     "$INSTALL_DIR/"
 cp "$SCRIPT_DIR/.env.example"         "$INSTALL_DIR/"
-chmod 755 "$INSTALL_DIR/sesame_auto.py" "$INSTALL_DIR/update_vacaciones.py"
+chmod 755 "$INSTALL_DIR/sesame_auto.py" "$INSTALL_DIR/update_vacaciones.py" "$INSTALL_DIR/test_check_http.py"
 echo "   ✔ Scripts copiados."
 
 # ── 5. Copiar carpetas de usuarios ────────────────────────────────────────────
