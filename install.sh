@@ -55,12 +55,11 @@ mkdir -p "$INSTALL_DIR"
 
 # ── 4. Copiar scripts ─────────────────────────────────────────────────────────
 echo "[ 3/6 ] Copiando scripts…"
-cp "$SCRIPT_DIR/sesame_auto.py"        "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/update_vacaciones.py"  "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/test_fichar.py"        "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/requirements.txt"      "$INSTALL_DIR/"
-cp "$SCRIPT_DIR/.env.example"          "$INSTALL_DIR/"
-chmod 755 "$INSTALL_DIR/sesame_auto.py" "$INSTALL_DIR/update_vacaciones.py" "$INSTALL_DIR/test_fichar.py"
+cp "$SCRIPT_DIR/sesame_auto.py"       "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/update_vacaciones.py" "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/requirements.txt"     "$INSTALL_DIR/"
+cp "$SCRIPT_DIR/.env.example"         "$INSTALL_DIR/"
+chmod 755 "$INSTALL_DIR/sesame_auto.py" "$INSTALL_DIR/update_vacaciones.py"
 echo "   ✔ Scripts copiados."
 
 # ── 5. Copiar carpetas de usuarios ────────────────────────────────────────────
@@ -88,16 +87,13 @@ for username in "${FOUND_USERS[@]}"; do
 done
 
 # ── 6. Entorno virtual Python ─────────────────────────────────────────────────
-echo "[ 5/6 ] Instalando Python + Playwright…"
+echo "[ 5/6 ] Instalando Python + dependencias…"
 python3 -m venv "$VENV_DIR"
 "$VENV_DIR/bin/pip" install --quiet --upgrade pip
 "$VENV_DIR/bin/pip" install --quiet -r "$INSTALL_DIR/requirements.txt"
-"$VENV_DIR/bin/python" -m playwright install chromium
-# Instala las dependencias de sistema que Chromium necesita (detecta la distro automáticamente)
-"$VENV_DIR/bin/python" -m playwright install-deps chromium
-echo "   ✔ Python y Chromium listos."
+echo "   ✔ Python y dependencias listos."
 
-# ── 7. Cron jobs (uno por usuario, L-V a las 07:00) ──────────────────────────
+# ── 7. Cron jobs (uno por usuario, L-V a las 05:30) ──────────────────────────
 echo "[ 6/6 ] Configurando cron jobs…"
 
 # Elimina TODAS las entradas anteriores para reconstruirlas limpias
@@ -109,26 +105,15 @@ NEW_CRON_LINES=""
 # Sin esto, cron usa UTC del servidor y el script ficharía 2h tarde en verano.
 NEW_CRON_LINES=$'\nTZ=Europe/Madrid'
 
-# Horarios escalonados para evitar que dos usuarios lancen Playwright a la vez
-# User 1 → 05:30, User 2 → 05:45, User 3 → 06:00, etc.
-_STAGGER_MINUTES=30
-for i in "${!FOUND_USERS[@]}"; do
-    username="${FOUND_USERS[$i]}"
+for username in "${FOUND_USERS[@]}"; do
     ENV_PATH="$INSTALL_DIR/users/$username/.env"
     LOG_AUTO="$INSTALL_DIR/users/$username/sesame_auto.log"
     LOG_VAC="$INSTALL_DIR/users/$username/update_vacaciones.log"
 
-    CRON_MINUTE=$((_STAGGER_MINUTES + i * 15))
-    CRON_HOUR=5
-    if [ "$CRON_MINUTE" -ge 60 ]; then
-        CRON_MINUTE=$((CRON_MINUTE - 60))
-        CRON_HOUR=6
-    fi
-
-    # Fichaje diario: lunes a viernes, escalonado
-    CRON_LINE="$CRON_MINUTE $CRON_HOUR * * 1-5 $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $ENV_PATH >> $LOG_AUTO 2>&1"
+    # Fichaje diario: lunes a viernes, misma hora para todos (sin contención)
+    CRON_LINE="30 5 * * 1-5 $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $ENV_PATH >> $LOG_AUTO 2>&1"
     NEW_CRON_LINES="$NEW_CRON_LINES"$'\n'"$CRON_LINE"
-    echo "   ✔ Cron '$username': L-V $CRON_HOUR:$(printf '%02d' $CRON_MINUTE) Madrid → sesame_auto.py (log: $LOG_AUTO)"
+    echo "   ✔ Cron '$username': L-V 05:30 Madrid → sesame_auto.py (log: $LOG_AUTO)"
 
     # Actualización diaria de vacaciones: siempre a las 05:00
     CRON_VAC="0 5 * * * $VENV_DIR/bin/python $INSTALL_DIR/update_vacaciones.py --env $ENV_PATH >> $LOG_VAC 2>&1"
@@ -174,11 +159,6 @@ echo ""
 echo "Prueba en seco (sin fichar):"
 for username in "${FOUND_USERS[@]}"; do
     echo "  SESAME_DRY_RUN=true $VENV_DIR/bin/python $INSTALL_DIR/sesame_auto.py --env $INSTALL_DIR/users/$username/.env"
-done
-echo ""
-echo "Test manual (abre navegador):"
-for username in "${FOUND_USERS[@]}"; do
-    echo "  $VENV_DIR/bin/python $INSTALL_DIR/test_fichar.py --env $INSTALL_DIR/users/$username/.env"
 done
 echo ""
 echo "Logs en tiempo real:"

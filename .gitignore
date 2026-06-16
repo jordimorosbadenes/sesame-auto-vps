@@ -8,6 +8,9 @@ state.json
 *.log
 users/**/state.json
 users/**/browser_session*.json
+users/**/http_session*.json
 users/**/screenshots*/
 users/**/screenshots_test/
+users/**/debug/
+users/**/debug_*
 .opencode/

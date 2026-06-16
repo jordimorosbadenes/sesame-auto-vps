@@ -4,64 +4,108 @@
 
 ```
 Cron (Linux)
-    ↓ 07:00 lunes-viernes
+    ↓ 05:30 lunes-viernes
 sesame_auto.py --env users/nombre/.env
     ├─ Carga estado semanal (state.json)
     ├─ Calcula horario de hoy con jitter ±15 min
+    ├─ Aplica sobrescrituras del .env (por día de la semana)
     ├─ Ajusta salida para ~40 h/semana
-    ├─ Espera a cada hora y ejecuta do_check()
+    ├─ Espera a cada hora y ejecuta do_check() via HTTP
     └─ Actualiza estado (horas, timestamps)
 ```
 
 ---
 
-## 1. Cron Job: Arranque a las 07:00
+## 1. Cron Job: Arranque a las 05:30
 
 ### Configuración (VPS Linux)
 
-```bash
-crontab -e
-```
+El instalador (`install.sh`) configura automáticamente el cron. Todos los usuarios
+comparten la misma hora (05:30) ya que no hay contención de recursos.
 
 ```
-0 7 * * 1-5 /opt/sesame/venv/bin/python /opt/sesame/sesame_auto.py --env /opt/sesame/users/jordi/.env
+30 5 * * 1-5 /opt/sesame/venv/bin/python /opt/sesame/sesame_auto.py --env /opt/sesame/users/jordi/.env
 ```
 
-- **0 7** → Minuto 0, hora 7 (07:00:00 CET)
-- **\* \* 1-5** → Todos los meses, todos los días, lunes-viernes (1=lun, 5=vie)
-- El script **se ejecuta una sola vez al día**, a las 07:00
+- **30 5** → Minuto 30, hora 5 (05:30 CET)
+- **\* \* 1-5** → Lunes-viernes
+- El script **se ejecuta una sola vez al día**, a las 05:30
 
 ### Qué pasa en el arranque
 
-1. `main()` se ejecuta a las 07:00
+1. `main()` se ejecuta a las 05:30
 2. Lee `state.json` para saber:
    - Horas acumuladas esta semana
    - Si ya se han hecho fichajes hoy
 3. Si es fin de semana, sale sin hacer nada
-4. Calcula el horario de hoy
-5. **Se queda corriendo** hasta que termine el día (aprox. 18:00)
+4. Si es vacaciones (según `vacaciones.txt`), sale sin hacer nada
+5. Calcula el horario de hoy (con jitter y sobrescrituras del .env)
+6. **Se queda corriendo** hasta que termine el día (~19:00)
 
 ---
 
-## 2. Ciclo de vida del script: Estado persistente
+## 2. SesameHTTP: Fichaje via HTTP
+
+Ya no se usa navegador. Todo el fichaje se hace con peticiones HTTP directas
+usando `requests` + `BeautifulSoup`.
+
+### Login (CakePHP CSRF)
+
+```
+GET  https://panel.sesametime.com
+  → Extrae campos ocultos del formulario #UserLoginForm:
+     - _method
+     - data[_Token][key]
+     - data[_Token][fields]
+     - data[_Token][unlocked]
+
+POST https://panel.sesametime.com/users/login?redirect=...
+  → Envía todos los campos CSRF + data[User][email] + data[User][password]
+  → Si el login es correcto, redirige a /admin/users/checks
+```
+
+### Lectura de estado
+
+```
+GET https://panel.sesametime.com/admin/users/checks
+  → Busca <a id="check_button"> en el HTML
+  → Clase CSS:
+     - "ssm-btn-checkout" → estado = IN (puede hacer check out)
+     - "ssm-btn-checkin"  → estado = OUT (puede hacer check in)
+```
+
+### Toggle fichaje
+
+```
+GET https://panel.sesametime.com/admin/checks/check_panel/1
+  → El servidor cambia el estado (toggle)
+  → Redirige a /admin/users/checks/0
+```
+
+Cada operación tarda **0.5–2 segundos** (vs 5–15 minutos con Playwright).
+
+---
+
+## 3. Ciclo de vida del script: Estado persistente
 
 ### Fichero: `state.json`
 
 ```json
 {
-  "week_start": "2026-04-20",
+  "week_start": "2026-06-15",
   "week_hours": 39.5,
   "today_schedule": {
-    "date": "2026-04-22",
-    "done": ["check_in"],
+    "date": "2026-06-17",
+    "done": ["check_in", "lunch_out"],
     "actual_times": {
-      "check_in": "2026-04-22T08:04:30+02:00"
+      "check_in": "2026-06-17T09:04:30+02:00",
+      "lunch_out": "2026-06-17T13:02:15+02:00"
     },
     "target_hours": 8.2,
-    "check_in": "2026-04-22T08:04:30+02:00",
-    "lunch_out": "2026-04-22T13:02:15+02:00",
-    "lunch_in": "2026-04-22T14:01:45+02:00",
-    "check_out": "2026-04-22T17:18:30+02:00"
+    "check_in": "2026-06-17T09:04:30+02:00",
+    "lunch_out": "2026-06-17T13:02:15+02:00",
+    "lunch_in": "2026-06-17T14:01:45+02:00",
+    "check_out": "2026-06-17T18:18:30+02:00"
   }
 }
 ```
@@ -75,7 +119,18 @@ crontab -e
 
 ---
 
-## 3. Jitter: ±15 minutos aleatoria
+## 4. Sesión HTTP persistente
+
+El script guarda las cookies de sesión en `http_session.json` después de cada
+operación. Si se reinicia el script, carga las cookies guardadas para evitar
+un nuevo login.
+
+Si la sesión ha expirado (el servidor redirige a `/users/login`), el script
+reloguea automáticamente antes de la siguiente operación.
+
+---
+
+## 5. Jitter: ±15 minutos aleatoria
 
 ### Función: `_jittered()`
 
@@ -88,34 +143,49 @@ def _jittered(hour: int, minute: int, jitter: int, tz) -> datetime:
 ```
 
 **Ejemplo:**
-- Entrada programada: 08:00
+- Entrada programada: 09:00
 - Jitter: ±15 min = ±900 segundos
-- Resultado posible: 08:04:30 (4 min 30 seg después)
-- Otro resultado: 07:53:12 (6 min 48 seg antes)
+- Resultado posible: 09:04:30 (4 min 30 seg después)
+- Otro resultado: 08:53:12 (6 min 48 seg antes)
 
-**Propósito:** Simular un comportamiento humano realista (no siempre a la hora exacta).
+**Propósito:** Simular un comportamiento humano realista.
 
 ### Horarios del día con jitter:
 
 ```python
 SCHEDULE = {
-    "check_in":  dict(hour=8,  minute=0,  jitter=15),   # 07:45 ~ 08:15
+    "check_in":  dict(hour=9,  minute=0,  jitter=15),   # 08:45 ~ 09:15
     "lunch_out": dict(hour=13, minute=0,  jitter=15),   # 12:45 ~ 13:15
     "lunch_in":  dict(hour=14, minute=0,  jitter=15),   # 13:45 ~ 14:15
-    "check_out": dict(hour=17, minute=0,  jitter=15),   # 16:45 ~ 17:15
+    "check_out": dict(hour=18, minute=0,  jitter=15),   # 17:45 ~ 18:15
 }
 ```
 
+### Sobrescritura por .env
+
+El horario se puede personalizar por día de la semana via CSV en el `.env`:
+
+```env
+# CSV: lunes, martes, miercoles, jueves, viernes
+SESAME_CHECK_IN_1_HOUR=9,9,10,9,9
+SESAME_CHECK_OUT_2_HOUR=18,18,19,18,18
+```
+
+El orden de prioridad es:
+1. `SESAME_{DAY}_{STEP}_{FIELD}` (por día, ej: `SESAME_TUESDAY_CHECK_IN_HOUR`)
+2. `SESAME_{STEP}_{FIELD}` (global, ej: `SESAME_CHECK_IN_1_HOUR`)
+3. Valores por defecto del código (9, 13, 14, 18)
+
 ---
 
-## 4. Cálculo del horario diario: 40 horas semanales
+## 6. Cálculo del horario diario: 40 horas semanales
 
 ### Objetivo: Acumular ~40 horas/semana con margen flexible
 
 #### Paso 1: Calcular horas restantes
 
 ```python
-def build_schedule(tz, week_hours: float) -> dict:
+def build_schedule(tz, week_hours: float, schedule: dict) -> dict:
     today = date.today()
     days_left = 5 - today.weekday()  # lunes=0, viernes=4
     
@@ -123,7 +193,7 @@ def build_schedule(tz, week_hours: float) -> dict:
     # Si hoy es viernes (4): days_left = 5 - 4 = 1 (viernes)
     
     target_today = (TARGET_H - week_hours) / max(days_left, 1)
-    target_today = max(6.5, min(9.5, target_today))  # Límite razonable
+    target_today = max(6.5, min(9.5, target_today))
 ```
 
 **Ejemplo:**
@@ -134,34 +204,33 @@ def build_schedule(tz, week_hours: float) -> dict:
 #### Paso 2: Calcular tiempo de mañana
 
 ```python
-t_in  = _jittered(8,  0, 15, tz=tz)   # 08:00 ±15 min
+t_in  = _jittered(9,  0, 15, tz=tz)   # 09:00 ±15 min
 t_lo  = _jittered(13, 0, 15, tz=tz)   # 13:00 ±15 min
 t_li  = _jittered(14, 0, 15, tz=tz)   # 14:00 ±15 min
 
 morning_h = (t_lo - t_in).total_seconds() / 3600
-# Ejemplo: 13:02 - 08:04 = 4h 58 min = ~4.97 horas
+# Ejemplo: 13:02 - 09:04 = 3h 58 min = ~3.97 horas
 ```
 
-#### Paso 3: Calcular hora de salida para cumplir objetivo
+#### Paso 3: Calcular hora de salida
 
 ```python
 afternoon_h = target_today - morning_h
-# Ejemplo: 8.0 - 4.97 = 3.03 horas
+# Ejemplo: 8.0 - 3.97 = 4.03 horas
 
 t_out = t_li + timedelta(hours=afternoon_h)
-# Ejemplo: 14:01 + 3:01:48 = 17:02:48
+# Ejemplo: 14:01 + 4:01:48 = 18:02:48
 
-# Pequeño jitter adicional en la salida (±6 min)
+# Jitter adicional en la salida (±6 min)
 t_out += timedelta(seconds=random.randint(-6*60, 6*60))
-# Resultado posible: 17:05:20
 ```
 
 #### Paso 4: Validación (sanity check)
 
 ```python
-# La salida nunca debe ser antes de 16:30 ni después de 18:30
-lo_limit = t_li.replace(hour=16, minute=30)  # 16:30
-hi_limit = t_li.replace(hour=18, minute=30)  # 18:30
+co_hour = schedule["check_out"]["hour"]
+lo_limit = t_li.replace(hour=max(6, co_hour - 1), minute=0)  # ej: 17:00
+hi_limit = t_li.replace(hour=min(23, co_hour + 1), minute=30)  # ej: 19:30
 
 if t_out < lo_limit:
     t_out = lo_limit + timedelta(seconds=random.randint(0, 5*60))
@@ -169,19 +238,11 @@ if t_out > hi_limit:
     t_out = hi_limit - timedelta(seconds=random.randint(0, 5*60))
 ```
 
-**Resultado final:**
-```
-check_in:  08:04:30
-lunch_out: 13:02:15
-lunch_in:  14:01:45
-check_out: 17:05:20  ← ajustado para ~8 horas
-```
+Los límites se adaptan automáticamente según la hora de salida configurada.
 
 ---
 
-## 5. Loop principal: Espera y ejecución de fichajes
-
-### Código principal
+## 7. Loop principal
 
 ```python
 steps = [
@@ -192,198 +253,57 @@ steps = [
 ]
 
 for step_name, action_label in steps:
-    # ¿Ya se hizo este paso hoy?
     if is_done(state, step_name):
-        log.info(f"  {step_name}: ya realizado hoy, omitiendo.")
-        continue
+        continue  # ya hecho hoy
 
-    # ¿Qué hora es ahora? ¿Hay que esperar?
     target_dt = datetime.fromisoformat(sched[step_name]).replace(tzinfo=tz)
-    now = datetime.now(tz)
+    _sleep_until(target_dt)
 
-    # Si el momento ya pasó hace >45 min, omitir
-    if now > target_dt and (now - target_dt).total_seconds() > 45*60:
-        log.info(f"  {step_name}: momento ya pasó hace >45 min, omitiendo.")
-        mark_done(state, step_name, actual_time="SKIPPED")
-        continue
+    success = False
+    sesame = SesameHTTP()
+    for attempt in range(MAX_RETRIES + 1):
+        if attempt > 0:
+            time.sleep(backoff)
+            sesame = SesameHTTP()
+        success = sesame.do_check(action_label, expected_before, expected_after)
+        if success:
+            break
 
-    # Si aún no es hora, esperar
-    if now < target_dt:
-        _sleep_until(target_dt)
-
-    # YA ES HORA: Ejecutar fichaje
-    success = do_check(action_label)
     if success:
-        mark_done(state, step_name, actual_time=datetime.now(tz).isoformat())
-        actual_hours = calculate_hours_worked(check_in_time, check_out_time)
-        add_week_hours(state, actual_hours)
+        mark_done(state, step_name, actual_now.isoformat())
 ```
 
-### Flujo paso a paso
-
-**07:00** → Script arranca
-- Carga estado (`state.json`)
-- Hoy es 2026-04-22 (miércoles)
-- Semana: lunes 2026-04-20
-- Horas acumuladas: 16.5h
-
-**Calcula horario:**
-- `target_today = (40 - 16.5) / 3 = 7.83h`
-- `check_in: 08:04:30`
-- `lunch_out: 13:02:15`
-- `lunch_in: 14:01:45`
-- `check_out: 17:06:20` (ajustado para 7.83h)
-
-**Guarda en `state.json`**
-
-**Loop inicia:**
-1. **08:04:30** → Espera hasta esa hora → Ejecuta `do_check("check_in")` → Abre navegador, hace login, pulsa botón → Guarda sesión, screenshot
-2. **13:02:15** → Espera → Ejecuta `do_check("lunch_out")`
-3. **14:01:45** → Espera → Ejecuta `do_check("lunch_in")`
-4. **17:06:20** → Espera → Ejecuta `do_check("check_out")`
-
-**Después de check_out:**
-- Calcula horas reales: 17:06:20 - 08:04:30 = 8.95 horas (con pausa comida)
-- Actualiza `state.json`: `week_hours: 16.5 + 7.83 = 24.33h`
-- Script termina
-
-**Próximo día (jueves):**
-- Cron arranca a las 07:00 otra vez
-- Lee `state.json`: semana_horas = 24.33h
-- Calcula: `target_today = (40 - 24.33) / 2 = 7.835h`
-- Repite el ciclo
+Cada paso:
+1. Espera hasta la hora programada
+2. Crea una sesión HTTP (con cookies guardadas)
+3. Obtiene la página de checks, lee el estado actual
+4. Si el estado ya es el esperado, omite
+5. Hace GET al endpoint de toggle (`/admin/checks/check_panel/1`)
+6. Verifica que el estado cambió
+7. Guarda cookies actualizadas
+8. Si falla, reintenta con backoff (10s, 20s, 40s)
 
 ---
 
-## 6. Funciones clave
+## 8. Garantía de desfichaje
 
-### `do_check(action_label: str) -> bool`
-
-Ejecuta un fichaje completo:
-
-```python
-def do_check(action_label: str) -> bool:
-    if DRY_RUN:
-        log.info(f"  [DRY RUN] Simular fichaje: {action_label}")
-        return True
-
-    with sync_playwright() as pw:
-        # 1. Lanza Chromium
-        browser = pw.chromium.launch(headless=HEADLESS, ...)
-        
-        # 2. Crea contexto con cookies guardadas
-        ctx_kwargs = {"storage_state": SESSION_FILE}
-        context = browser.new_context(**ctx_kwargs)
-        page = context.new_page()
-
-        try:
-            # 3. Navega a https://panel.sesametime.com/admin/users/checks
-            page.goto(CHECKS_URL, timeout=30000)
-            
-            # 4. ¿Necesita login?
-            if _needs_login(page):
-                page.goto(LOGIN_URL)
-                _do_login(page)  # Rellena email/password
-                page.goto(CHECKS_URL)
-            
-            # 5. Guarda sesión (cookies) para próxima vez
-            context.storage_state(path=SESSION_FILE)
-            
-            # 6. Pulsa el botón de fichaje
-            return _click_check_button(page, action_label)
-
-        finally:
-            context.close()
-            browser.close()
-```
-
-**Retorna:** `True` si fichaje OK, `False` si error
-
-### `_sleep_until(target: datetime)`
-
-Espera hasta la hora objetivo, mostrando progreso:
+Si `check_out` falla durante el día, el script sigue reintentando hasta las
+19:00, cada 5 minutos, usando HTTP (instantáneo, sin bloqueo).
 
 ```python
-def _sleep_until(target: datetime):
-    wait = (target - datetime.now(target.tzinfo)).total_seconds()
-    if wait <= 0:
-        return
-    log.info(f"  ⏳ Esperando {wait / 60:.1f} min hasta {target.strftime('%H:%M:%S')} …")
-    time.sleep(wait)  # Bloquea hasta esa hora
-```
-
-**Ejemplo:**
-```
-⏳ Esperando 234.5 min hasta 08:04:30 …
-[espera 234 minutos y medio]
-Botón pulsado correctamente
-```
-
-### `is_done(state, step) -> bool` y `mark_done()`
-
-Registro persistente de pasos completados:
-
-```python
-def is_done(state: dict, step: str) -> bool:
-    sched = get_today_schedule(state)
-    return bool(sched and step in sched.get("done", []))
-
-def mark_done(state: dict, step: str, actual_time: str):
-    sched = get_today_schedule(state) or {
-        "date": date.today().isoformat(),
-        "done": [],
-        "actual_times": {},
-    }
-    sched.setdefault("done", []).append(step)
-    sched.setdefault("actual_times", {})[step] = actual_time
-    state["today_schedule"] = sched
-    _save_state(state)
+while datetime.now(tz) < hard_deadline:
+    sesame = SesameHTTP()
+    actual_state = sesame.get_check_state()
+    if actual_state == "OUT":
+        break  # ya desfichado
+    elif actual_state == "IN":
+        sesame.do_toggle()  # fuerza check out
+    time.sleep(300)
 ```
 
 ---
 
-## 7. Robustez: Idempotencia y recuperación
-
-### Caso 1: Script se reinicia a las 14:30
-
-```
-07:00  Script arranca (cron)
-...
-10:00  Error en VPS, reinicio
-10:05  Cron intenta ejecutar, pero en crontab aparece como "ya ejecutado"
-       → No pasa nada (cron no re-ejecuta el mismo job del mismo día)
-```
-
-**NOTA:** El cron no re-ejecuta si el script sigue corriendo. Si se reinicia el sistema:
-
-```
-07:00  Cron arranca script
-13:00  VPS se reinicia (apagón)
-       
-13:05  VPS se recupera, cron NO ejecuta (ya fue hoy)
-13:30  Usuario ejecuta manualmente:
-       python sesame_auto.py --env users/jordi/.env
-       
-       Script lee state.json:
-       - check_in: ✓ done
-       - lunch_out: ✓ done
-       - lunch_in: ⚠ NO HECHO (hora = 14:01, ahora = 13:30)
-       → Continúa normalmente desde aquí
-```
-
-### Caso 2: Script se queda colgado
-
-```
-Script arrancó a 07:00 pero se queda esperando entrada (network issue)
-Usuario ejecuta en otro terminal:
-    python test_fichar.py --env users/jordi/.env
-    → Abre sesión separada (browser_session_test.json)
-    → Prueba manual sin interferir con el principal
-```
-
----
-
-## 8. Logs y debugging
+## 9. Logs y debugging
 
 ### Fichero de log
 
@@ -391,48 +311,32 @@ Usuario ejecuta en otro terminal:
 /opt/sesame/users/jordi/sesame_auto.log
 ```
 
-Ejemplo de ejecución exitosa:
+Ejemplo de ejecución:
 
 ```
-2026-04-22 07:00:01 [INFO] ═══════════════════════════════════════════════════════
-2026-04-22 07:00:01 [INFO]   sesame_auto arrancando para 2026-04-22
-2026-04-22 07:00:01 [INFO]   MODO REAL
-2026-04-22 07:00:01 [INFO] ═══════════════════════════════════════════════════════
-2026-04-22 07:00:02 [INFO] Horas esta semana: 16.50h / 40.0h
-2026-04-22 07:00:03 [INFO] Horario hoy → entrada: 08:04 | salida comida: 13:02 | vuelta: 14:01 | salida: 17:06 (objetivo 7.83 h)
-2026-04-22 07:00:03 [INFO] ⏳ Esperando 64.5 min hasta 08:04:30 …
-2026-04-22 08:04:31 [INFO]   Navegando a https://panel.sesametime.com/admin/users/checks …
-2026-04-22 08:05:12 [INFO]   Sesión activa, omitiendo login.
-2026-04-22 08:05:13 [INFO]   Buscando botón de fichaje (check_in)…
-2026-04-22 08:05:15 [INFO]   Botón encontrado: 'Fichar'. Pulsando…
-2026-04-22 08:05:16 [INFO]   ✓ Fichaje 'check_in' realizado.
-2026-04-22 08:05:17 [INFO]   📷 Screenshot: /opt/sesame/users/jordi/screenshots/20260422_080516_after_check_in.png
-2026-04-22 08:05:18 [INFO] ⏳ Esperando 294.5 min hasta 13:02:15 …
-2026-04-22 13:02:16 [INFO]   ✓ Fichaje 'lunch_out' realizado.
-2026-04-22 14:01:45 [INFO]   ✓ Fichaje 'lunch_in' realizado.
-2026-04-22 17:06:21 [INFO]   ✓ Fichaje 'check_out' realizado.
-2026-04-22 17:06:22 [INFO] ✓ Horas trabajadas: 8.95h (acumulado: 25.45h)
+2026-06-17 05:30:01 [INFO] =======================================================
+2026-06-17 05:30:01 [INFO]   sesame_auto arrancando para 2026-06-17
+2026-06-17 05:30:01 [INFO]   MODO REAL
+2026-06-17 05:30:01 [INFO] =======================================================
+2026-06-17 05:30:02 [INFO] Horas esta semana: 16.50h / 40.0h
+2026-06-17 05:30:03 [INFO] Horario hoy -> entrada: 08:53 | salida comida: 13:10 | vuelta: 14:01 | salida: 18:05 (objetivo 7.83 h)
+2026-06-17 05:30:03 [INFO] [WAIT] Esperando 203.0 min hasta 08:53:00 ...
+2026-06-17 08:53:01 [INFO]   Iniciando sesion...
+2026-06-17 08:53:02 [INFO]   Sesion ya activa.
+2026-06-17 08:53:02 [INFO]   Estado correcto (OUT -> IN)
+2026-06-17 08:53:02 [INFO]   Toggle: https://panel.sesametime.com/admin/checks/check_panel/1
+2026-06-17 08:53:03 [INFO]   [OK] Estado verificado: IN
+2026-06-17 08:53:03 [INFO]   check_in completado.
+2026-06-17 08:53:04 [INFO] [WAIT] Esperando 251.9 min hasta 13:10:00 ...
 ```
 
-### Ver log en tiempo real
+### HTML de debug
+
+Cuando ocurre un error, se guarda el HTML de la respuesta en `users/jordi/debug/`:
 
 ```bash
-tail -f /opt/sesame/users/jordi/sesame_auto.log
+ls /opt/sesame/users/jordi/debug/
 ```
-
----
-
-## 9. Ejemplo completo: Una semana
-
-| Día | Estado | Horas objetivo | Entrada | Comida | Vuelta | Salida | Real | Acumulado |
-|-----|--------|----------------|---------|--------|--------|--------|------|-----------|
-| Lun | Lunes 0h | 8.0h | 08:05 | 13:02 | 14:01 | 17:06 | 8.95h | 8.95h |
-| Mar | +8.95h | 7.76h | 08:03 | 13:01 | 14:00 | 17:02 | 8.92h | 17.87h |
-| Mié | +17.87h | 7.38h | 08:07 | 13:04 | 14:03 | 17:05 | 8.90h | 26.77h |
-| Jue | +26.77h | 6.61h | 08:02 | 13:00 | 14:02 | 16:39 | 7.95h | 34.72h |
-| Vie | +34.72h | 5.28h | 08:04 | 13:03 | 14:01 | 16:01 | 6.89h | 41.61h |
-
-**Resultado:** 41.61h (1.61h extra, distribuidoras en la semana).
 
 ---
 
@@ -444,35 +348,24 @@ tail -f /opt/sesame/users/jordi/sesame_auto.log
 SESAME_DRY_RUN=true python sesame_auto.py --env users/jordi/.env
 ```
 
-Output:
-```
-[DRY RUN] Simular fichaje: check_in
-[DRY RUN] Simular fichaje: lunch_out
-[DRY RUN] Simular fichaje: lunch_in
-[DRY RUN] Simular fichaje: check_out
-```
-
-### Test manual (abre navegador)
+### Test HTTP manual
 
 ```bash
-python test_fichar.py --env users/jordi/.env
-```
-
-Hace UN solo fichaje visible.
-
-### Ver screenshots después de ejecutar
-
-```bash
-ls -la /opt/sesame/users/jordi/screenshots/
-# Abre con imagen viewer si está en máquina local:
-eog /opt/sesame/users/jordi/screenshots/*_check_in.png
+python test_check_http.py --env users/jordi/.env           # solo lectura
+python test_check_http.py --env users/jordi/.env --check    # fichaje real
 ```
 
 ### Resetear estado (borrar historial de la semana)
 
 ```bash
 rm /opt/sesame/users/jordi/state.json
-# Próxima ejecución empezará con 0 horas
+rm /opt/sesame/users/jordi/http_session.json  # forzar login nuevo
+```
+
+### Ver log en tiempo real
+
+```bash
+tail -f /opt/sesame/users/jordi/sesame_auto.log
 ```
 
 ### Cambiar zona horaria
@@ -483,52 +376,28 @@ TZ=Europe/Madrid    # Por defecto
 TZ=America/New_York # Para US
 ```
 
-Soporta cualquier timezone de `zoneinfo` (IANA).
-
 ---
 
-## 11. Diagrama de flujo
+## 11. Comparativa: Playwright vs HTTP
 
-```
-Cron 07:00
-    ↓
-main()
-    ├─ ¿Fin de semana? → SALIR
-    ├─ load_state() → state.json
-    ├─ get_week_hours() → 16.5h
-    ├─ build_schedule(16.5h) → horarios + jitter
-    │  ├─ check_in:  08:04:30
-    │  ├─ lunch_out: 13:02:15
-    │  ├─ lunch_in:  14:01:45
-    │  └─ check_out: 17:06:20 ← CALCULADO para 7.83h
-    ├─ save state
-    │
-    └─ LOOP: para cada paso
-        ├─ ¿Ya hecho hoy? → skip
-        ├─ ¿Pasó hace >45min? → skip
-        ├─ sleep_until(target_time)
-        ├─ do_check()
-        │  ├─ Launch Chromium
-        │  ├─ Load cookies
-        │  ├─ Navigate a checks URL
-        │  ├─ Login si needed
-        │  ├─ Click button
-        │  └─ Save screenshot + cookies
-        ├─ mark_done()
-        └─ update week_hours
-
-Script finaliza ~18:00
-    ↓
-Próximo día: Cron ejecuta de nuevo a 07:00
-```
-
----
+| Aspecto | Playwright (v1/v2) | HTTP (v3) |
+|---------|-------------------|-----------|
+| Tiempo por fichaje | 5–15 min | 0.5–2 s |
+| RAM por operación | ~500 MB (Chromium) | ~5 MB |
+| Dependencias | playwright + Chromium (~400 MB) | requests + bs4 (~5 MB) |
+| Lock entre usuarios | fcntl global | No necesario |
+| Sesión | browser_session.json | http_session.json |
+| Debug | screenshots PNG | HTML dumps |
+| Robustez ante red lenta | Timeouts frecuentes | Timeouts de 30s |
+| Líneas de código | ~1123 | ~637 |
 
 ## Sumario
 
-- **Cron:** Una ejecución/día a las 07:00 (lunes-viernes)
+- **Cron:** Una ejecución/día a las 05:30 (lunes-viernes)
+- **Transporte:** HTTP requests (sin navegador)
 - **Jitter:** ±15 min en cada hora para simular comportamiento humano
 - **40 horas:** Se calcula dinámicamente cada día según horas restantes
+- **Sobrescritura:** Horario personalizable por día via CSV en .env
 - **Estado:** Persistente en `state.json`, permite recuperación ante fallos
 - **Idempotencia:** Si algo falla, próxima ejecución continúa desde donde quedó
 - **Logs:** Todo en `/opt/sesame/users/nombre/sesame_auto.log`

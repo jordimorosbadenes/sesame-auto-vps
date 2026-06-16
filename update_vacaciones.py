@@ -1,42 +1,35 @@
 #!/usr/bin/env python3
 """
-update_vacaciones.py – Descarga el iCal de Sesame HR y actualiza vacaciones.txt
+update_vacaciones.py - Descarga el iCal de Sesame HR y actualiza vacaciones.txt
 ================================================================================
 Uso:
-  # Descarga automática via Playwright (recomendado):
   python update_vacaciones.py --env users/jordi/.env
 
-  # Con fichero .ics ya descargado manualmente:
+  Con fichero .ics ya descargado manualmente:
   python update_vacaciones.py --env users/jordi/.env --ical /ruta/Sesame-Calendar.ics
 
 El fichero vacaciones.txt se regenera cada vez (sobrescribe el anterior).
-Incluye:
-  · Días "Calendario Valencia" que sean laborables (L-V) → festivos nacionales/autonómicos
-  · Días "Vacaciones*"                                   → vacaciones propias
-
-Los fines de semana (que también aparecen en el iCal como "Calendario Valencia")
-se omiten del fichero porque sesame_auto.py ya los gestiona por separado.
-
-Se puede ejecutar manualmente o vía cron mensual (ej: 1 de cada mes a las 05:00).
+Incluye dias "Calendario Valencia" (festivos L-V) y dias "Vacaciones*".
 """
 
+import json
 import logging
 import os
 import sys
 import time
-from datetime import date, datetime
+from datetime import date, datetime, timedelta
 from pathlib import Path
+from urllib.parse import urljoin
 
 from dotenv import load_dotenv
-from playwright.sync_api import (
-    Browser,
-    BrowserContext,
-    Page,
-    TimeoutError as PlaywrightTimeout,
-    sync_playwright,
-)
 
-# ── Carga del .env (igual que sesame_auto.py) ─────────────────────────────────
+try:
+    import requests
+    from bs4 import BeautifulSoup
+except ImportError:
+    print("Faltan dependencias. Ejecuta: pip install requests beautifulsoup4 python-dotenv")
+    sys.exit(1)
+
 _env_arg = next(
     (sys.argv[i + 1] for i, a in enumerate(sys.argv) if a == "--env" and i + 1 < len(sys.argv)),
     None,
@@ -54,24 +47,15 @@ def _resolve_path(env_var: str, default: str) -> Path:
     return p.resolve()
 
 
-SESAME_EMAIL    = os.environ.get("SESAME_EMAIL", "")
+SESAME_EMAIL = os.environ.get("SESAME_EMAIL", "")
 SESAME_PASSWORD = os.environ.get("SESAME_PASSWORD", "")
-SESSION_FILE    = _resolve_path("SESAME_SESSION",    "browser_session.json")
+SESSION_FILE = _resolve_path("SESAME_HTTP_SESSION", "http_session.json")
 VACACIONES_FILE = _resolve_path("SESAME_VACACIONES", "vacaciones.txt")
-HEADLESS        = os.environ.get("SESAME_HEADLESS",  "true").lower() == "true"
 
-LOGIN_URL     = "https://panel.sesametime.com"
-VACATIONS_URL   = "https://panel.sesametime.com/admin/users/vacations"
-CHECKS_URL      = "https://panel.sesametime.com/admin/users/checks"
-# URLs alternativas por si la principal requiere permisos de admin
-VACATIONS_PATHS = [
-    "https://panel.sesametime.com/admin/users/vacations",
-    "https://panel.sesametime.com/users/vacations",
-    "https://panel.sesametime.com/vacations",
-    "https://panel.sesametime.com",   # home: buscar via menú
-]
+BASE_URL = "https://panel.sesametime.com"
+VACATIONS_VIEW_URL = f"{BASE_URL}/admin/vacations/view"
 
-# ── Logging ───────────────────────────────────────────────────────────────────
+
 logging.basicConfig(
     level=logging.INFO,
     format="%(asctime)s [%(levelname)s] %(message)s",
@@ -81,38 +65,106 @@ logging.basicConfig(
 log = logging.getLogger(__name__)
 
 
-# ── iCal parser ───────────────────────────────────────────────────────────────
+# ── Sesame HTTP session ─────────────────────────────────────────────────────
+
+
+class SesameSession:
+    """Mantiene sesion HTTP en Sesame HR."""
+
+    def __init__(self):
+        self.session = requests.Session()
+        self.session.headers.update({
+            "User-Agent": (
+                "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+                "(KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+            ),
+            "Accept-Language": "es-ES,es;q=0.9,en;q=0.8",
+        })
+        self._load_cookies()
+
+    def _load_cookies(self):
+        if SESSION_FILE.exists():
+            try:
+                data = json.loads(SESSION_FILE.read_text())
+                jar = requests.utils.cookiejar_from_dict(data.get("cookies", {}))
+                self.session.cookies = jar
+            except Exception:
+                pass
+
+    def _save_cookies(self):
+        SESSION_FILE.parent.mkdir(parents=True, exist_ok=True)
+        data = {"cookies": requests.utils.dict_from_cookiejar(self.session.cookies)}
+        SESSION_FILE.write_text(json.dumps(data, indent=2))
+
+    def login(self) -> bool:
+        """Login a Sesame HR. Devuelve True si ok."""
+        log.info("  Iniciando sesion...")
+        try:
+            resp = self.session.get(BASE_URL, timeout=30)
+            soup = BeautifulSoup(resp.text, "html.parser")
+            form = soup.select_one("#UserLoginForm")
+            if not form:
+                log.info("  Sesion ya activa.")
+                self._save_cookies()
+                return True
+
+            fields = {}
+            for inp in form.select("input[type='hidden']"):
+                name = inp.get("name")
+                if name:
+                    fields[name] = inp.get("value", "")
+
+            action = form.get("action", "")
+            action_url = urljoin(BASE_URL, action) if action else BASE_URL
+            fields["data[User][email]"] = SESAME_EMAIL
+            fields["data[User][password]"] = SESAME_PASSWORD
+
+            resp = self.session.post(action_url, data=fields, timeout=30, allow_redirects=True)
+
+            if "login" not in resp.url.lower():
+                self._save_cookies()
+                log.info("  Login completado.")
+                return True
+
+            log.error("  Login fallido.")
+            return False
+        except requests.RequestException as e:
+            log.error(f"  Error de red: {e}")
+            return False
+
+    def get(self, url: str, **kwargs) -> requests.Response | None:
+        """GET request, reloguea si redirige a login."""
+        resp = self.session.get(url, timeout=30, **kwargs)
+        if "login" in resp.url.lower():
+            log.info("  Sesion expirada, relogueando...")
+            if not self.login():
+                return None
+            resp = self.session.get(url, timeout=30, **kwargs)
+        return resp
+
+
+# ── iCal parser (sin cambios) ────────────────────────────────────────────────
+
 
 def parse_ical(text: str) -> list:
-    """
-    Lee un fichero iCal y devuelve lista ordenada de fechas (date) que deben
-    tratarse como días no laborables:
-      · SUMMARY empieza por "Calendario" → festivos (solo días L-V; los fines
-        de semana en este grupo se omiten porque sesame_auto ya los salta).
-      · SUMMARY empieza por "Vacaciones" → días de vacaciones (todos incluidos).
-    """
+    """Lee un fichero iCal y devuelve lista de fechas no laborables."""
     dates = []
     in_event = False
     summary = ""
     dtstart = None
-
     for raw_line in text.splitlines():
         line = raw_line.strip()
-
         if line == "BEGIN:VEVENT":
             in_event, summary, dtstart = True, "", None
-
         elif line == "END:VEVENT":
             if dtstart:
                 s = summary.upper()
                 if s.startswith("VACACIONES"):
                     dates.append(dtstart)
                 elif s.startswith("CALENDARIO"):
-                    # Solo incluir si es día laborable (lunes=0 … viernes=4)
                     if dtstart.weekday() < 5:
                         dates.append(dtstart)
             in_event = False
-
         elif in_event:
             if line.startswith("SUMMARY:"):
                 summary = line[8:]
@@ -122,333 +174,89 @@ def parse_ical(text: str) -> list:
                     dtstart = datetime.strptime(val[:8], "%Y%m%d").date()
                 except ValueError:
                     pass
-
     return sorted(set(dates))
 
 
 def dates_to_vacaciones(dates: list) -> str:
-    """
-    Convierte lista de fechas ordenadas al formato de vacaciones.txt.
-    Agrupa días consecutivos en rangos (2026-08-01..2026-08-14).
-    """
+    """Convierte fechas a formato vacaciones.txt con rangos."""
     regen_path = _env_path if _env_path else Path(__file__).parent / ".env"
-
     if not dates:
         return (
-            f"# Generado automáticamente desde Sesame iCal – {date.today().isoformat()}\n"
+            f"# Generado automaticamente desde Sesame iCal - {date.today().isoformat()}\n"
             f"# Para regenerar ahora:\n"
             f"#   python {__file__} --env {regen_path}\n"
-            f"# (sin días no laborables)\n"
+            f"# (sin dias no laborables)\n"
         )
-
     lines = [
-        f"# Generado automáticamente desde Sesame iCal – {date.today().isoformat()}",
+        f"# Generado automaticamente desde Sesame iCal - {date.today().isoformat()}",
         "# Festivos laborables + vacaciones propias (fines de semana excluidos)",
         f"# Para regenerar ahora:",
         f"#   python {__file__} --env {regen_path}",
         "",
     ]
-
     start = end = dates[0]
     for d in dates[1:]:
-        from datetime import timedelta
         if (d - end).days == 1:
             end = d
         else:
             lines.append(str(start) if start == end else f"{start}..{end}")
             start = end = d
     lines.append(str(start) if start == end else f"{start}..{end}")
-
     return "\n".join(lines) + "\n"
 
 
-# ── Playwright: login ─────────────────────────────────────────────────────────
-
-def _needs_login(page: Page) -> bool:
-    url = page.url.lower()
-    if any(k in url for k in ("login", "signin", "sign-in", "auth")):
-        return True
-    for sel in ["#UserEmail", 'input[name="email"]', 'input[type="email"]']:
-        try:
-            el = page.query_selector(sel)
-            if el and el.is_visible():
-                return True
-        except Exception:
-            pass
-    return False
+# ── Descarga HTTP del iCal ──────────────────────────────────────────────────
 
 
-def _do_login(page: Page) -> bool:
-    log.info("  Sesión no activa, haciendo login…")
-    log.info(f"  URL en login: {page.url}")
-    email_filled = False
-    for sel in ["#UserEmail", 'input[name="email"]', 'input[type="email"]',
-                'input[name="data[User][email]"]']:
-        try:
-            el = page.wait_for_selector(sel, timeout=5000, state="visible")
-            if el:
-                el.fill(SESAME_EMAIL)
-                log.info(f"  Email rellenado con selector: {sel}")
-                email_filled = True
-                break
-        except PlaywrightTimeout:
-            log.debug(f"  Email selector no encontrado: {sel}")
-            continue
-    if not email_filled:
-        log.error("  No se encontró el campo de email. Email vacío.")
-        _screenshot(page, "login_no_email")
-        return False
-    time.sleep(0.3)
-    pwd_filled = False
-    for sel in ["#UserPassword", 'input[name="password"]', 'input[type="password"]',
-                'input[name="data[User][password]"]']:
-        try:
-            el = page.wait_for_selector(sel, timeout=5000, state="visible")
-            if el:
-                el.fill(SESAME_PASSWORD)
-                log.info(f"  Password rellenado con selector: {sel}")
-                pwd_filled = True
-                break
-        except PlaywrightTimeout:
-            log.debug(f"  Password selector no encontrado: {sel}")
-            continue
-    if not pwd_filled:
-        log.error("  No se encontró el campo de contraseña.")
-        _screenshot(page, "login_no_pwd")
-        return False
-    time.sleep(0.3)
-    for sel in ['input[type="submit"]', 'button[type="submit"]',
-                "button:has-text('Entrar')", "button:has-text('Iniciar sesión')",
-                "button:has-text('Login')"]:
-        try:
-            el = page.wait_for_selector(sel, timeout=5000, state="visible")
-            if el:
-                el.click()
-                log.info(f"  Submit clickado: {sel}")
-                break
-        except PlaywrightTimeout:
-            continue
-    try:
-        page.wait_for_url(lambda url: "login" not in url.lower(), timeout=15000)
-        log.info(f"  Login completado. URL: {page.url}")
-        try:
-            page.wait_for_load_state("networkidle", timeout=10_000)
-        except PlaywrightTimeout:
-            pass
-        return True
-    except PlaywrightTimeout:
-        if not _needs_login(page):
-            log.info(f"  Login completado (sin cambio URL). URL: {page.url}")
-            return True
-        log.error(f"  Login fallido. URL: {page.url}")
-        _screenshot(page, "login_failed")
-        return False
-
-
-# ── Playwright: descarga del iCal ─────────────────────────────────────────────
-
-# Selectores para el botón de exportar iCal (en orden de probabilidad)
-ICAL_EXPORT_SELECTORS = [
-    "a:has-text('Exportar iCal')",
-    "button:has-text('Exportar iCal')",
-    "a:has-text('Export iCal')",
-    "button:has-text('iCal')",
-    "a:has-text('iCal')",
-    "a[href*='.ics']",
-    "a[href*='ical']",
-    "a[href*='calendar']",
-    "[data-action*='ical']",
-    "[title*='iCal']",
-]
-
-# Selectores para navegar a "Mis vacaciones" desde el menú
-VACATIONS_NAV_SELECTORS = [
-    "a:has-text('Mis vacaciones')",
-    "a:has-text('Vacaciones')",
-    "nav a:has-text('Vacaciones')",
-    "[href*='vacation']",
-    "[href*='vacacion']",
-]
-
-
-def _screenshot(page: Page, path):
-    """Toma un screenshot ignorando errores (no debe bloquear el flujo)."""
-    try:
-        page.screenshot(path=str(path), timeout=5000)
-    except Exception as e:
-        log.debug(f"  Screenshot omitido: {e}")
-
-
-def _find_ical_button(page: Page):
-    """Busca el botón de exportar iCal en la página actual. Devuelve el elemento o None."""
-    for sel in ICAL_EXPORT_SELECTORS:
-        try:
-            el = page.wait_for_selector(sel, timeout=4000, state="visible")
-            if el:
-                log.info(f"  Botón iCal encontrado: {sel!r}")
-                return el
-        except PlaywrightTimeout:
-            continue
+def _find_ical_link(html: str, page_url: str) -> str | None:
+    """Busca en el HTML el enlace al iCal. Devuelve URL absoluta o None."""
+    soup = BeautifulSoup(html, "html.parser")
+    for a in soup.select("a[href]"):
+        href = a.get("href", "")
+        text = a.get_text(strip=True)
+        if "export_ical" in href:
+            return urljoin(page_url, href)
+        if "ical" in text.lower() or "ical" in href.lower():
+            return urljoin(page_url, href)
     return None
 
 
-def download_ical_playwright() -> str | None:
-    """
-    Abre Playwright, navega a la sección de vacaciones y descarga el iCal.
-    Devuelve el contenido del fichero .ics como string, o None si falla.
-    """
-    with sync_playwright() as pw:
-        browser: Browser = pw.chromium.launch(
-            headless=HEADLESS,
-            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu", "--disable-extensions"],
-        )
-        ctx_kwargs: dict = {
-            "viewport": {"width": 1280, "height": 720},
-            "user_agent": (
-                "Mozilla/5.0 (X11; Linux x86_64) "
-                "AppleWebKit/537.36 (KHTML, like Gecko) "
-                "Chrome/124.0.0.0 Safari/537.36"
-            ),
-            "locale": "es-ES",
-            "accept_downloads": True,
-        }
-        # No cargamos session guardada aquí: una sesión parcial/expirada
-        # hace que el login aterrice en el home sin sidebar en vez del dashboard.
-        # Siempre login fresco para garantizar redirect al dashboard completo.
+def download_ical_http() -> str | None:
+    """Descarga el iCal de Sesame via HTTP. Devuelve contenido .ics o None."""
+    ses = SesameSession()
 
-        context: BrowserContext = browser.new_context(**ctx_kwargs)
-        page: Page = context.new_page()
-        page.set_default_navigation_timeout(90_000)
-        page.set_default_timeout(15_000)
+    # Login
+    if not ses.login():
+        return None
 
-        _sc_dir = _user_dir / "screenshots"
-        _sc_dir.mkdir(parents=True, exist_ok=True)
+    # Navegar a la pagina de vacaciones
+    log.info(f"  Navegando a {VACATIONS_VIEW_URL} ...")
+    resp = ses.get(VACATIONS_VIEW_URL)
+    if resp is None:
+        log.error("  No se pudo acceder a la pagina de vacaciones.")
+        return None
 
-        try:
-            # ── Login: igual que sesame_auto.py, ir a CHECKS_URL primero.     ──
-            # CHECKS_URL redirige a /users/login?redirect=... si no hay sesión,
-            # lo que permite detectar el cambio de URL tras el submit del login.
-            # (Ir directamente a LOGIN_URL no funciona: la SPA renderiza el form
-            # en panel.sesametime.com/ sin "login" en la URL, y wait_for_url
-            # resuelve inmediatamente antes de que el form se envíe.)
-            log.info(f"  Navegando a {CHECKS_URL} …")
-            page.goto(CHECKS_URL, wait_until="domcontentloaded", timeout=90_000)
-            time.sleep(2)
+    log.info(f"  URL: {resp.url} (status {resp.status_code})")
+    ical_url = _find_ical_link(resp.text, resp.url)
+    if ical_url:
+        log.info(f"  URL iCal encontrada: {ical_url}")
+    else:
+        log.error("  No se encontro el enlace iCal.")
+        return None
 
-            if _needs_login(page):
-                if not _do_login(page):
-                    log.error("  Login fallido.")
-                    return None
+    # Descargar el iCal
+    log.info(f"  Descargando iCal...")
+    resp = ses.get(ical_url, allow_redirects=True)
+    if resp is None:
+        log.error("  No se pudo descargar el iCal.")
+        return None
 
-            log.info(f"  Sesión activa. URL: {page.url}")
-
-            # ── Navegar a "Mis vacaciones" via click ──────────────────────────
-            log.info("  Buscando botón 'Mis vacaciones' en el menú…")
-            vacaciones_btn = None
-            for sel in VACATIONS_NAV_SELECTORS:
-                try:
-                    el = page.wait_for_selector(sel, timeout=5000, state="visible")
-                    if el:
-                        log.info(f"  Encontrado: {sel!r} → '{el.inner_text().strip()}'")
-                        vacaciones_btn = el
-                        break
-                except PlaywrightTimeout:
-                    continue
-
-            if not vacaciones_btn:
-                log.error("  No se encontró el botón 'Mis vacaciones'.")
-                _screenshot(page, _sc_dir / "no_vacaciones_btn.png")
-                log.error(f"  Screenshot: {_sc_dir / 'no_vacaciones_btn.png'}")
-                return None
-
-            # Click "Mis vacaciones" — el click dispara navegación que puede
-            # tardar y agotar el timeout; si la URL cambia, fue exitoso.
-            try:
-                vacaciones_btn.click(timeout=15_000)
-            except PlaywrightTimeout:
-                # La navegación ocurrió (ver call log) pero la carga tardó más
-                # del timeout. Si ya estamos en la URL correcta, continuamos.
-                if "vacation" not in page.url.lower():
-                    log.error("  Click 'Mis vacaciones' falló sin navegar.")
-                    return None
-                log.warning("  Click timeout pero URL cambió — continuando.")
-            # Esperar cambio de URL confirmado
-            try:
-                page.wait_for_url(lambda url: "vacation" in url.lower(), timeout=10_000)
-            except PlaywrightTimeout:
-                pass
-            time.sleep(3)
-            log.info(f"  URL vacaciones: {page.url}")
-
-            # ── Obtener URL del iCal via JS DOM (sin requisito de visibilidad) ──
-            # En headless/VPS la SPA puede no renderizar elementos visibles, pero
-            # el DOM sí tiene los hrefs. Buscamos el enlace directamente.
-            ical_url: str | None = page.evaluate("""
-                () => {
-                    const links = Array.from(document.querySelectorAll('a[href]'));
-                    const found = links.find(a =>
-                        a.href.includes('ical') ||
-                        a.href.includes('export_ical') ||
-                        a.href.endsWith('.ics')
-                    );
-                    return found ? found.href : null;
-                }
-            """)
-            if ical_url:
-                log.info(f"  URL iCal encontrada via JS DOM: {ical_url}")
-
-            # Fallback: wait_for_selector con state="attached" (en DOM, no visible)
-            if not ical_url:
-                for sel in ["a[href*='ical']", "a[href*='export_ical']", "a[href*='.ics']",
-                            "a:has-text('Exportar iCal')", "a:has-text('iCal')"]:
-                    try:
-                        el = page.wait_for_selector(sel, timeout=5000, state="attached")
-                        if el:
-                            href = el.get_attribute("href")
-                            if href:
-                                from urllib.parse import urljoin
-                                ical_url = urljoin(page.url, href)
-                                log.info(f"  URL iCal encontrada (attached): {ical_url}")
-                                break
-                    except PlaywrightTimeout:
-                        continue
-
-            if not ical_url:
-                # Diagnóstico: volcar todos los <a> del DOM (no solo visibles)
-                all_links: list = page.evaluate("""
-                    () => Array.from(document.querySelectorAll('a')).map(
-                        a => (a.getAttribute('href') || '') + ' | ' + a.innerText.slice(0, 60)
-                    )
-                """)
-                log.error("  ✗ No se encontró la URL del iCal.")
-                log.error(f"  URL actual: {page.url}")
-                log.error(f"  Total <a> en DOM: {len(all_links)}")
-                for lnk in all_links[:40]:
-                    log.error(f"    {lnk}")
-                log.error("  → Usa --ical /ruta/Sesame-Calendar.ics para modo manual.")
-                return None
-
-            # ── Descargar iCal via HTTP con cookies de sesión ─────────────────
-            # Usamos context.request para reutilizar las cookies del login.
-            # Esto evita necesitar que el botón sea visible/clickable.
-            log.info(f"  Descargando {ical_url} …")
-            response = context.request.get(ical_url)
-            if not response.ok:
-                log.error(f"  HTTP {response.status} al descargar iCal")
-                return None
-            content = response.text()
-            log.info(f"  ✓ iCal descargado ({len(content):,} bytes).")
-            return content
-
-        except Exception as e:
-            log.error(f"  ✗ Error descargando iCal: {e}")
-            return None
-        finally:
-            context.close()
-            browser.close()
+    log.info(f"  Descargado ({len(resp.text):,} bytes).")
+    return resp.text
 
 
 # ── Entry point ───────────────────────────────────────────────────────────────
+
 
 def main():
     ical_arg = next(
@@ -464,21 +272,20 @@ def main():
         log.info(f"Usando iCal local: {ical_path}")
         ical_text = ical_path.read_text(encoding="utf-8")
     else:
-        log.info("Descargando iCal desde Sesame…")
-        ical_text = download_ical_playwright()
+        log.info("Descargando iCal desde Sesame...")
+        ical_text = download_ical_http()
         if not ical_text:
             log.error("No se pudo obtener el iCal.")
             sys.exit(1)
 
     dates = parse_ical(ical_text)
-    log.info(f"Días no laborables encontrados: {len(dates)}")
+    log.info(f"Dias no laborables encontrados: {len(dates)}")
 
     content = dates_to_vacaciones(dates)
     VACACIONES_FILE.parent.mkdir(parents=True, exist_ok=True)
     VACACIONES_FILE.write_text(content, encoding="utf-8")
-    log.info(f"✓ {VACACIONES_FILE} actualizado.")
+    log.info(f"[OK] {VACACIONES_FILE} actualizado.")
 
-    # Mostrar primeras entradas para verificación
     preview = [l for l in content.splitlines() if l and not l.startswith("#")][:12]
     log.info("Primeras entradas:\n  " + "\n  ".join(preview))
 
