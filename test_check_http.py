@@ -239,26 +239,26 @@ def main():
     # ── 4. Hacer fichaje (si --check) ────────────────────────────────
     if DO_CHECK and btn_href:
         print()
-        info(f"Haciendo fichaje → {btn_href}…")
+        info(f"Haciendo fichaje -> {btn_href}...")
 
         check_url = urljoin(checks_url, btn_href)
         t0 = time.time()
         resp = session.get(check_url, timeout=30, allow_redirects=True)
         t1 = time.time()
-        ok(f"GET {check_url} → Status {resp.status_code} en {t1-t0:.1f}s | URL: {resp.url}")
+        ok(f"GET {check_url} -> Status {resp.status_code} en {t1-t0:.1f}s | URL: {resp.url}")
 
         if "login" in resp.url.lower():
-            warn("GET redirigió a login. Probando POST…")
+            warn("GET redirigio a login. Probando POST...")
             t0 = time.time()
             resp = session.post(check_url, timeout=30, allow_redirects=True)
             t1 = time.time()
-            ok(f"POST {check_url} → Status {resp.status_code} en {t1-t0:.1f}s | URL: {resp.url}")
+            ok(f"POST {check_url} -> Status {resp.status_code} en {t1-t0:.1f}s | URL: {resp.url}")
 
         time.sleep(1)
 
         # ── 5. Verificar estado post-fichaje ─────────────────────────
         print()
-        info("Verificando estado después del fichaje…")
+        info("Verificando estado despues del fichaje...")
 
         resp = session.get(checks_url, timeout=30)
         soup = BeautifulSoup(resp.text, "html.parser")
@@ -267,22 +267,22 @@ def main():
         if btn_after:
             new_classes = btn_after.get("class", [])
             new_text = btn_after.get_text(strip=True)
-            info(f"Botón ahora: texto='{new_text}' clases={new_classes}")
+            info(f"Boton ahora: texto='{new_text}' clases={new_classes}")
             new_state = extract_state_from_button(btn_after)
             if new_state:
                 info(f"Nuevo estado: {new_state}")
                 if new_state != current_state:
                     print()
-                    ok("FICHAJE EXITOSO — el estado cambió correctamente.")
+                    ok("FICHAJE EXITOSO - el estado cambio correctamente.")
                 else:
                     print()
-                    warn("El estado NO cambió.")
+                    warn("El estado NO cambio. Reintenta el comando.")
                     save_debug_html(resp.text, "post_check_same_state")
             else:
                 warn("No se pudo determinar el nuevo estado.")
                 save_debug_html(resp.text, "post_check_no_state")
         else:
-            err("No se encontró botón después del fichaje.")
+            err("No se encontro boton despues del fichaje.")
             save_debug_html(resp.text, "post_check_no_button")
             return False
 

@@ -194,7 +194,7 @@ class SesameHTTP:
             return None
 
     def do_toggle(self) -> bool:
-        """Pulsa el boton de fichaje (sin verificar estado previo)."""
+        """Pulsa el boton de fichaje."""
         try:
             resp = self.session.get(CHECKS_URL, timeout=30)
             if "login" in resp.url.lower():
@@ -275,6 +275,7 @@ class SesameHTTP:
                     log.info(f"  [OK] Estado verificado: {new_state}")
                 else:
                     log.warning(f"  Estado tras fichaje: {new_state} (esperaba {expected_after})")
+                    return False
 
             return True
         except requests.RequestException as e:
