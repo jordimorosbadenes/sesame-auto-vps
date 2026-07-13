@@ -46,7 +46,7 @@ echo ""
 # ── 2. Dependencias del sistema ───────────────────────────────────────────────
 echo "[ 1/6 ] Instalando dependencias del sistema…"
 apt-get update -q
-apt-get install -y -q python3 python3-pip python3-venv
+apt-get install -y -q python3 python3-pip python3-venv cron
 echo "   ✔ Dependencias del sistema listas."
 
 # ── 3. Crear directorio de instalación ────────────────────────────────────────
